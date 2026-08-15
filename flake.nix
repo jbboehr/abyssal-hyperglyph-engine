@@ -79,10 +79,13 @@
             actionlint
             clang-tools
             gdb
+            git
             aheBroker
             aheLauncher
             phpWithAhe
+            php.packages.composer
             php.unwrapped.dev
+            time
             valgrind
           ];
 

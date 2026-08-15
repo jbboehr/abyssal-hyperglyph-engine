@@ -10,6 +10,11 @@ if ($fixture === false || !opcache_is_script_cached($fixture)) {
     fwrite(STDERR, "A PHPStan process did not attach to the retained OPcache generation.\n");
     exit(86);
 }
+require_once $fixture;
+if (ahe_persistent_fixture() !== 'the cache remembers') {
+    fwrite(STDERR, "A PHPStan process could not link a persisted child class.\n");
+    exit(86);
+}
 if (($personality & 0x40000) === 0 || getenv('AHE_EXPECT_NO_ASLR') !== '1') {
     fwrite(STDERR, "A PHPStan process did not inherit the AHE launcher contract.\n");
     exit(86);

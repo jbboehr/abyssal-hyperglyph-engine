@@ -77,6 +77,19 @@ Run all build, smoke, and repository checks:
 nix flake check --print-build-logs
 ```
 
+Run a controlled real-project benchmark against PHPUnit 12.5.33:
+
+```console
+nix develop
+scripts/benchmark-phpstan.sh --samples 5
+```
+
+The benchmark reports AHE and process-local OPcache separately with PHPStan's
+result cache cold and warm. See
+[`benchmarks/phpstan/README.md`](benchmarks/phpstan/README.md) for the cache
+controls, the immutable-PHAR OPcache profile, and the real-project class-linking
+regression that currently prevents timing from starting.
+
 Enter the development environment:
 
 ```console
