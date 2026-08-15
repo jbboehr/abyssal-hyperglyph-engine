@@ -13,12 +13,16 @@ in {
       ../LICENSE.md
       ../README.md
       ../benchmarks/phpstan/README.md
+      ../benchmarks/phpstan/jit-function/opcache.ini
+      ../benchmarks/phpstan/jit/opcache.ini
       ../benchmarks/phpstan/opcache-status.php
       ../benchmarks/phpstan/opcache.ini
       ../benchmarks/phpstan/require-ahe-attachment.php
+      ../benchmarks/phpstan/vanilla/opcache.ini
       ../config.m4
       ../docs/LICENSE_EXCEPTION.md
       ../docs/architecture.md
+      ../docs/development/phpstan-benchmarks.md
       ../flake.lock
       ../flake.nix
       ./checks.nix

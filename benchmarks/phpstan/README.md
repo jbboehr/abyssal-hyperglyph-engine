@@ -10,7 +10,7 @@ Run it from the development shell:
 
 ```console
 nix develop
-scripts/benchmark-phpstan.sh --samples 5
+scripts/benchmark-phpstan.sh --samples 6
 ```
 
 This also provides real-world regression coverage for cross-process class
@@ -21,12 +21,40 @@ the original reduction using one cached class that extends an internal PHP
 class.
 
 The checkout, installed Composer dependencies, logs, metadata, raw TSV samples,
-and summary stay under the benchmark cache directory printed by the script.
+timed AHE population runs, and summaries stay under the benchmark cache
+directory printed by the script.
 Set `AHE_BENCHMARK_WORK_DIRECTORY` to move that directory.
 The harness rejects a dirty checkout or locally modified installed Composer
 packages rather than labeling them as the pinned workload.
 
+Completed development measurements and their interpretation are recorded in
+[`docs/development/phpstan-benchmarks.md`](../../docs/development/phpstan-benchmarks.md).
+
 ## Cache controls
+
+The harness runs six modes with the same patched PHP binary and extension set:
+
+- `vanilla`: CLI OPcache disabled;
+- `opcache`: ordinary process-local CLI OPcache;
+- `opcache-jit`: process-local OPcache with a 64 MiB tracing JIT buffer;
+- `opcache-jit-function`: process-local OPcache with PHP's whole-function,
+  compile-on-script-load JIT preset;
+- `ahe`: broker-retained OPcache with JIT disabled;
+- `ahe-jit`: a separately broker-retained generation with the same JIT profile
+  as `opcache-jit`.
+
+The process-local JIT modes isolate each JIT strategy's effect from persistence.
+Comparing `ahe-jit` with `opcache-jit` isolates the effect of retaining a
+tracing-JIT cache. The two AHE modes use separate brokers so their different
+allocation sizes and OPcache configurations never contend for the prototype
+broker's single generation.
+
+Whole-function JIT is intentionally process-local in this matrix. Its
+compile-on-script-load machine code currently crashes independently attached
+PHPStan workers after they receive work, while the equivalent process-local
+workers complete. AHE must not advertise or benchmark that combination until
+its additional process-local JIT state is identified and reinitialized during
+reattachment.
 
 The benchmark reports two independent PHPStan result-cache states:
 
@@ -35,18 +63,28 @@ The benchmark reports two independent PHPStan result-cache states:
   analysis.
 
 PHPStan's generated dependency-injection container remains warm and at the same
-path throughout, so it is not confused with the result cache. Each state
-alternates ordinary process-local OPcache and AHE samples to reduce ordering
-bias. The AHE generation is primed with a complete, result-cache-cold analysis
-before timing starts.
+path throughout, so it is not confused with the result cache. A balanced
+Latin-square order puts every mode in every execution position and varies its
+neighbors to reduce ordering and carryover bias. Sample counts must be a
+multiple of the six modes so the harness always executes complete
+counterbalancing blocks. Each AHE generation is primed with a complete,
+result-cache-cold analysis before sample collection; these cache-populating
+invocations are timed and reported separately rather than mixed with attached
+samples. Before warm-result-cache samples begin, each retained generation
+processes that snapshot once so the result-cache PHP file itself is already
+represented in OPcache; this transition is validated but not mixed into the
+steady-state timings.
 
-Both modes load the same file through PHPStan's `--autoload-file` option so the
-result-cache configuration is identical. In AHE mode it asserts attachment in
-every parent and worker; in baseline mode it is a no-op. A process that cannot
-find the AHE `memfd` mapping exits immediately, and each timed AHE sample must
-produce a fresh parent marker before it can be recorded. This prevents both
-result-cache invalidation and process-local fallback from distorting the
-comparison.
+Every mode loads the same file through PHPStan's `--autoload-file` option so the
+result-cache configuration is identical. It asserts the expected JIT state in
+every parent and worker; in AHE modes it also asserts attachment. A process that
+cannot find the AHE `memfd` mapping exits immediately, and each timed AHE sample
+must produce a fresh parent marker before it can be recorded. A post-sample
+probe additionally compares the retained JIT buffer with a baseline captured
+after startup allocated its stub handlers but before PHPStan ran. It therefore
+requires workload-generated JIT code rather than treating startup allocation as
+emission. These guards prevent configuration drift, result-cache invalidation,
+and process-local fallback from distorting the comparison.
 
 PHPStan runs its engine from a PHAR. With PHP 8.4's normal OPcache settings,
 timestamp and file-update checks cannot obtain a timestamp for internal PHAR

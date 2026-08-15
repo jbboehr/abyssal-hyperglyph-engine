@@ -82,11 +82,13 @@ Run a controlled real-project benchmark against PHPUnit 12.5.33:
 
 ```console
 nix develop
-scripts/benchmark-phpstan.sh --samples 5
+scripts/benchmark-phpstan.sh --samples 6
 ```
 
-The benchmark reports AHE and process-local OPcache separately with PHPStan's
-result cache cold and warm. See
+The benchmark compares vanilla PHP, process-local OPcache, and retained AHE
+OPcache, including matched tracing-JIT variants and a process-local
+whole-function JIT variant, while separately controlling whether PHPStan's
+result cache is cold or warm. See
 [`benchmarks/phpstan/README.md`](benchmarks/phpstan/README.md) for the cache
 controls, the immutable-PHAR OPcache profile, and the attachment assertions
 required before a sample is recorded.

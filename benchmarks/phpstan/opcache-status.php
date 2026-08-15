@@ -25,6 +25,19 @@ $projectScripts = array_filter(
     $scriptPaths,
     static fn (string $path): bool => str_starts_with($path, $projectRoot . DIRECTORY_SEPARATOR),
 );
+$jit = $status['jit'] ?? null;
+$jitEnabled = is_array($jit)
+    && ($jit['enabled'] ?? false) === true
+    && ($jit['on'] ?? false) === true;
+$actualJitMode = $jitEnabled ? strtolower((string) ini_get('opcache.jit')) : 'off';
+$expectedJitMode = (string) getenv('AHE_BENCHMARK_EXPECT_JIT_MODE');
+$jitStartupBufferFreeValue = (string) getenv('AHE_BENCHMARK_JIT_STARTUP_BUFFER_FREE');
+$jitStartupBufferFree = filter_var(
+    $jitStartupBufferFreeValue,
+    FILTER_VALIDATE_INT,
+    ['options' => ['min_range' => 1]],
+);
+$jitStartupBufferFree = is_int($jitStartupBufferFree) ? $jitStartupBufferFree : null;
 
 $report = [
     'cache_full' => $status['cache_full'] ?? null,
@@ -37,6 +50,11 @@ $report = [
     'free_memory' => $status['memory_usage']['free_memory'] ?? null,
     'phpstan_phar_scripts' => count($phpstanPharScripts),
     'project_scripts' => count($projectScripts),
+    'jit_enabled' => $jitEnabled,
+    'jit_mode' => $actualJitMode,
+    'jit_buffer_size' => is_array($jit) ? ($jit['buffer_size'] ?? null) : null,
+    'jit_buffer_free' => is_array($jit) ? ($jit['buffer_free'] ?? null) : null,
+    'jit_startup_buffer_free' => $jitStartupBufferFree,
 ];
 
 echo json_encode($report, JSON_PRETTY_PRINT | JSON_THROW_ON_ERROR), "\n";
@@ -47,6 +65,21 @@ if ($report['phpstan_phar_scripts'] === 0) {
 }
 if ($report['project_scripts'] === 0) {
     fwrite(STDERR, "The retained generation contains no PHPUnit project scripts.\n");
+    exit(1);
+}
+if ($actualJitMode !== $expectedJitMode) {
+    fwrite(STDERR, "The retained generation has the wrong JIT mode.\n");
+    exit(1);
+}
+if ($expectedJitMode !== 'off'
+    && (!is_int($report['jit_buffer_size'])
+        || !is_int($report['jit_buffer_free'])
+        || !is_int($report['jit_startup_buffer_free'])
+        || $report['jit_buffer_size'] <= 0
+        || $report['jit_startup_buffer_free'] >= $report['jit_buffer_size']
+        || $report['jit_buffer_free'] >= $report['jit_startup_buffer_free'])
+) {
+    fwrite(STDERR, "The retained JIT generation emitted no workload code beyond startup stubs.\n");
     exit(1);
 }
 if ($report['cache_full'] !== false

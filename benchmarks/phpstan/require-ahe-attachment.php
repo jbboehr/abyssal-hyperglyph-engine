@@ -2,12 +2,30 @@
 
 declare(strict_types=1);
 
+$expectedJitMode = (string) getenv('AHE_BENCHMARK_EXPECT_JIT_MODE');
+$status = opcache_get_status(false);
+$jit = is_array($status) ? ($status['jit'] ?? null) : null;
+$jitEnabled = is_array($jit)
+    && ($jit['enabled'] ?? false) === true
+    && ($jit['on'] ?? false) === true;
+$actualJitMode = $jitEnabled ? strtolower((string) ini_get('opcache.jit')) : 'off';
+if ($actualJitMode !== $expectedJitMode) {
+    fwrite(
+        STDERR,
+        sprintf(
+            "A PHPStan process started with JIT mode %s instead of %s.\n",
+            $actualJitMode,
+            $expectedJitMode,
+        ),
+    );
+    exit(86);
+}
+
 if (getenv('AHE_BENCHMARK_EXPECT_ATTACHMENT') !== '1') {
     return;
 }
 
 $maps = file_get_contents('/proc/self/maps');
-$status = opcache_get_status(false);
 if ($maps === false || !str_contains($maps, '/memfd:ahe-opcache') || $status === false) {
     fwrite(STDERR, "A PHPStan process fell back to process-local OPcache.\n");
     exit(86);
