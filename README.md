@@ -96,11 +96,15 @@ Run the reduced class-linking regression test without PHPStan:
 ```console
 nix develop
 scripts/reproduce-class-linking.sh
+scripts/reproduce-class-linking.sh --jit
 ```
 
 The script proves that a fresh process can instantiate a persisted user class
 that extends an internal class. It uses the fixed private path that exposed the
-original layout-sensitive fault; the same scenario is also a Nix flake check.
+original layout-sensitive fault. The `--jit` variant additionally verifies that
+the attaching process can compile and execute a new file-backed entry script
+using the retained JIT stub table. Both scenarios are Nix flake checks; JIT
+remains disabled in the packaged defaults.
 
 Enter the development environment:
 
@@ -145,7 +149,7 @@ patches/php/8.4/0001-external-shared-memory-provider.patch
 patches/php/8.4/0002-enable-shm-reattachment.patch
 ```
 
-`0001` adds the external shared-memory provider ABI to OPcache. `0002` enables the corresponding Zend-engine class-linking safeguards and makes OPcache avoid compile-time links to process-local internal classes; it must be present in both PHP core and the OPcache build.
+`0001` adds the external shared-memory provider ABI to OPcache. `0002` enables the corresponding Zend-engine class-linking safeguards, makes OPcache avoid compile-time links to process-local internal classes, and retains the JIT stub-address table needed by independently attached processes; it must be present in both PHP core and the OPcache build.
 
 Additional minor versions should be added only after the broker-backed two-process test succeeds on PHP 8.4.
 

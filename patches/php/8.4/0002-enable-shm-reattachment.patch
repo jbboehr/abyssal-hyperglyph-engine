@@ -37,3 +37,47 @@ index b0c410f4dc..ba0d4cd3ae 100644
 +die('skip SHM reattachment emits an additional DECLARE_CLASS_DELAYED opcode');
  ?>
  --FILE--
+diff --git a/ext/opcache/jit/zend_jit_ir.c b/ext/opcache/jit/zend_jit_ir.c
+index d944f17..4545f52 100644
+--- a/ext/opcache/jit/zend_jit_ir.c
++++ b/ext/opcache/jit/zend_jit_ir.c
+@@ -350,8 +350,8 @@ static const zend_jit_stub zend_jit_stubs[] = {
+ 	JIT_STUBS(JIT_STUB)
+ };
+ 
+-#if defined(_WIN32) || defined(IR_TARGET_AARCH64)
+-/* We keep addresses in SHM to share them between sepaeate processes (on Windows) or to support veneers (on AArch64) */
++#if defined(ZEND_OPCACHE_SHM_REATTACHMENT) || defined(IR_TARGET_AARCH64)
++/* We keep addresses in SHM to share them between separate processes or to support veneers (on AArch64) */
+ static void** zend_jit_stub_handlers = NULL;
+ #else
+ static void* zend_jit_stub_handlers[sizeof(zend_jit_stubs) / sizeof(zend_jit_stubs[0])];
+diff --git a/ext/opcache/jit/zend_jit.c b/ext/opcache/jit/zend_jit.c
+index 9c5e9a6..24ec389 100644
+--- a/ext/opcache/jit/zend_jit.c
++++ b/ext/opcache/jit/zend_jit.c
+@@ -3676,19 +3676,19 @@ void zend_jit_startup(void *buf, size_t size, bool reattached)
+ 	if (!reattached) {
+ 		zend_jit_unprotect();
+ 		*dasm_ptr = dasm_buf;
+-#if defined(_WIN32)
+-		zend_jit_stub_handlers = dasm_buf;
+-		*dasm_ptr = (void**)*dasm_ptr + sizeof(zend_jit_stubs) / sizeof(zend_jit_stubs[0]);
+-#elif defined(IR_TARGET_AARCH64)
++#if defined(IR_TARGET_AARCH64)
+ 		zend_jit_stub_handlers = dasm_buf;
+ 		*dasm_ptr = (void**)*dasm_ptr + (sizeof(zend_jit_stubs) / sizeof(zend_jit_stubs[0])) * 2;
+ 		memset(zend_jit_stub_handlers, 0, (sizeof(zend_jit_stubs) / sizeof(zend_jit_stubs[0])) * 2 * sizeof(void*));
++#elif defined(ZEND_OPCACHE_SHM_REATTACHMENT)
++		zend_jit_stub_handlers = dasm_buf;
++		*dasm_ptr = (void**)*dasm_ptr + sizeof(zend_jit_stubs) / sizeof(zend_jit_stubs[0]);
+ #endif
+ 		*dasm_ptr = (void*)ZEND_MM_ALIGNED_SIZE_EX(((size_t)(*dasm_ptr)), 16);
+ 		zend_jit_protect();
+ 	} else {
+-#if defined(_WIN32) || defined(IR_TARGET_AARCH64)
++#if defined(ZEND_OPCACHE_SHM_REATTACHMENT) || defined(IR_TARGET_AARCH64)
+ 		zend_jit_stub_handlers = dasm_buf;
+ 		zend_jit_init_handlers();
+ #endif
+ 	}

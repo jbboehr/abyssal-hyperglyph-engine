@@ -9,6 +9,29 @@ repository_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 fixture_source="$repository_root/tests/fixtures/class-linking.php"
 creator_source="$repository_root/tests/integration/class-linking-create.php"
 attacher_source="$repository_root/tests/integration/class-linking-attach.php"
+jit_options=()
+php_arguments=()
+
+case "${1:-}" in
+  "") ;;
+  --jit)
+    jit_options=(
+      -d opcache.jit=tracing
+      -d opcache.jit_buffer_size=64M
+      -d opcache.jit_hot_func=0
+      -d opcache.jit_hot_loop=1
+    )
+    php_arguments=(--jit)
+    ;;
+  *)
+    printf 'Usage: %s [--jit]\n' "$0" >&2
+    exit 2
+    ;;
+esac
+if [[ "$#" -gt 1 ]]; then
+  printf 'Usage: %s [--jit]\n' "$0" >&2
+  exit 2
+fi
 
 for required_command in ahe-broker ahe-php; do
   if ! type -P "$required_command" >/dev/null; then
@@ -72,13 +95,17 @@ export AHE_BROKER_SOCKET="$broker_socket"
 export AHE_CACHE_NAMESPACE=class-linking-reproducer
 
 ahe-php \
+  "${jit_options[@]}" \
   -d opcache.file_update_protection=0 \
-  "$fixture_root/creator.php"
+  "$fixture_root/creator.php" \
+  "${php_arguments[@]}"
 
 set +e
 ahe-php \
+  "${jit_options[@]}" \
   -d opcache.file_update_protection=0 \
-  "$fixture_root/attacher.php"
+  "$fixture_root/attacher.php" \
+  "${php_arguments[@]}"
 attacher_status=$?
 set -e
 

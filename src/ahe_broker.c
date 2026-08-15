@@ -155,6 +155,21 @@ static void ahe_generation_reset(ahe_generation *generation)
 	ahe_generation_init(generation);
 }
 
+static int ahe_cache_memfd_create(void)
+{
+#ifdef MFD_EXEC
+	int fd = memfd_create("ahe-opcache", MFD_CLOEXEC | MFD_EXEC);
+
+	if (fd < 0 && errno == EINVAL) {
+		/* Linux before 6.3 rejects the then-unknown MFD_EXEC flag. */
+		fd = memfd_create("ahe-opcache", MFD_CLOEXEC);
+	}
+	return fd;
+#else
+	return memfd_create("ahe-opcache", MFD_CLOEXEC);
+#endif
+}
+
 static int ahe_generation_create(
 	ahe_generation *generation,
 	int client_fd,
@@ -169,7 +184,7 @@ static int ahe_generation_create(
 		return -1;
 	}
 
-	generation->cache_fd = memfd_create("ahe-opcache", MFD_CLOEXEC);
+	generation->cache_fd = ahe_cache_memfd_create();
 	if (generation->cache_fd < 0
 	 || ftruncate(generation->cache_fd, (off_t) request->mapping_size) < 0) {
 		ahe_generation_reset(generation);
