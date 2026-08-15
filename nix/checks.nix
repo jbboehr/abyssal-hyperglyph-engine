@@ -349,6 +349,18 @@
       touch "$out"
     '';
 
+  jitFunctionReattachmentSmoke =
+    pkgs.runCommand "abyssal-hyperglyph-engine-jit-function-reattachment-smoke" {
+      nativeBuildInputs = [
+        aheBroker
+        aheLauncher
+      ];
+    } ''
+      bash ${repositorySource}/scripts/reproduce-jit-function.sh
+      bash ${repositorySource}/scripts/reproduce-jit-function.sh --concurrent
+      touch "$out"
+    '';
+
   phpstanParallelSmoke = pkgs.runCommand "abyssal-hyperglyph-engine-phpstan-parallel-smoke" {} ''
     broker_socket="$TMPDIR/ahe-broker.sock"
     marker_directory="$TMPDIR/phpstan-markers"
@@ -383,6 +395,7 @@
 
     AHE_BROKER_SOCKET="$broker_socket" \
     AHE_CACHE_NAMESPACE="nix-phpstan-parallel-smoke" \
+    PHP_INI_SCAN_DIR="${phpWithAhe}/lib:${../benchmarks/phpstan}:${../benchmarks/phpstan/jit-function}" \
       ${aheLauncher}/bin/ahe-php \
         ${../tests/integration/cache-create.php} \
         ${../tests/fixtures/persistent.php}
@@ -392,6 +405,7 @@
     AHE_PHPSTAN_MARKER_DIRECTORY="$marker_directory" \
     AHE_PHPSTAN_PERSISTED_FIXTURE=${../tests/fixtures/persistent.php} \
     AHE_PHPSTAN_TMP_DIRECTORY="$phpstan_tmp_directory" \
+    PHP_INI_SCAN_DIR="${phpWithAhe}/lib:${../benchmarks/phpstan}:${../benchmarks/phpstan/jit-function}" \
     PHPSTAN_TURBO=0 \
       ${aheLauncher}/bin/ahe-php \
         ${phpstanPhar} \
@@ -628,6 +642,7 @@ in {
     broker-lifecycle-smoke = brokerLifecycleSmoke;
     broker-multiplex-smoke = brokerMultiplexSmoke;
     class-linking-smoke = classLinkingSmoke;
+    jit-function-reattachment-smoke = jitFunctionReattachmentSmoke;
     jit-reattachment-smoke = jitReattachmentSmoke;
     launcher-smoke = launcherSmoke;
     persistence-smoke = persistenceSmoke;

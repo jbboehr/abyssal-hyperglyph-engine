@@ -5,6 +5,9 @@ declare(strict_types=1);
 $fixture = realpath((string) getenv('AHE_PHPSTAN_PERSISTED_FIXTURE'));
 $markerDirectory = (string) getenv('AHE_PHPSTAN_MARKER_DIRECTORY');
 $personality = hexdec(trim((string) file_get_contents('/proc/self/personality')));
+$status = opcache_get_status(true);
+$jit = is_array($status) ? ($status['jit'] ?? null) : null;
+$cachedScripts = is_array($status) ? ($status['scripts'] ?? null) : null;
 
 if ($fixture === false || !opcache_is_script_cached($fixture)) {
     fwrite(STDERR, "A PHPStan process did not attach to the retained OPcache generation.\n");
@@ -17,6 +20,24 @@ if (ahe_persistent_fixture() !== 'the cache remembers') {
 }
 if (($personality & 0x40000) === 0 || getenv('AHE_EXPECT_NO_ASLR') !== '1') {
     fwrite(STDERR, "A PHPStan process did not inherit the AHE launcher contract.\n");
+    exit(86);
+}
+if (!is_array($jit)
+    || ($jit['enabled'] ?? false) !== true
+    || ($jit['on'] ?? false) !== true
+    || ($jit['kind'] ?? null) !== 0
+    || ($jit['opt_level'] ?? null) !== 5
+) {
+    fwrite(STDERR, "A PHPStan process did not inherit whole-function JIT.\n");
+    exit(86);
+}
+if (!is_array($cachedScripts)
+    || !array_any(
+        array_keys($cachedScripts),
+        static fn (string $path): bool => str_starts_with($path, 'phar://'),
+    )
+) {
+    fwrite(STDERR, "A PHPStan process did not find cached PHPStan PHAR scripts.\n");
     exit(86);
 }
 if (!is_dir($markerDirectory)) {

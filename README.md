@@ -9,7 +9,7 @@ The repository slug is `abyssal-hyperglyph-engine`. The extension binary and bui
 The project currently provides a Linux/PHP 8.4 reattachment prototype:
 
 - a PHP 8.4 patch exposes the version-two external shared-memory provider ABI;
-- the packaged PHP build enables PHP's shared-memory reattachment safeguards and prevents OPcache from compiling against process-local internal classes;
+- the packaged PHP build enables PHP's shared-memory reattachment safeguards, prevents OPcache from compiling against process-local internal classes, and keeps retained JIT code from embedding process-local internal-function metadata;
 - AHE discovers OPcache during Zend extension loading and registers before OPcache startup;
 - the ABI covers allocation, detachment, a shared lock descriptor, locking, startup completion or failure, and shutdown;
 - `ahe-broker` retains cache and lock `memfd` descriptors and transfers them over a mutually authenticated, private Unix socket;
@@ -99,14 +99,19 @@ Run the reduced class-linking regression test without PHPStan:
 nix develop
 scripts/reproduce-class-linking.sh
 scripts/reproduce-class-linking.sh --jit
+scripts/reproduce-jit-function.sh
+scripts/reproduce-jit-function.sh --concurrent
 ```
 
 The script proves that a fresh process can instantiate a persisted user class
 that extends an internal class. It uses the fixed private path that exposed the
 original layout-sensitive fault. The `--jit` variant additionally verifies that
 the attaching process can compile and execute a new file-backed entry script
-using the retained JIT stub table. Both scenarios are Nix flake checks; JIT
-remains disabled in the packaged defaults.
+using the retained JIT stub table. The whole-function scripts cache and execute
+a PHAR-backed function in the creator, then execute that exact retained machine
+code in either one independent attacher or eight fresh attachers executing
+concurrently. These scenarios are Nix flake checks; JIT remains disabled in the
+packaged defaults.
 
 Enter the development environment:
 
@@ -151,7 +156,7 @@ patches/php/8.4/0001-external-shared-memory-provider.patch
 patches/php/8.4/0002-enable-shm-reattachment.patch
 ```
 
-`0001` adds the external shared-memory provider ABI to OPcache. `0002` enables the corresponding Zend-engine class-linking safeguards, makes OPcache avoid compile-time links to process-local internal classes, and retains the JIT stub-address table needed by independently attached processes; it must be present in both PHP core and the OPcache build.
+`0001` adds the external shared-memory provider ABI to OPcache. `0002` enables the corresponding Zend-engine class-linking safeguards, makes OPcache avoid compile-time links to process-local internal classes, retains the JIT stub-address table needed by independently attached processes, and applies PHP's internal-function JIT guards to every reattachment-capable build; it must be present in both PHP core and the OPcache build.
 
 Additional minor versions should be added only after the broker-backed two-process test succeeds on PHP 8.4.
 

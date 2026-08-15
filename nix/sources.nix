@@ -32,6 +32,7 @@ in {
       ../patches/php/8.4/0002-enable-shm-reattachment.patch
       ../scripts/benchmark-phpstan.sh
       ../scripts/reproduce-class-linking.sh
+      ../scripts/reproduce-jit-function.sh
       ../scripts/smoke-test.sh
       ../src/ahe_broker.c
       ../src/ahe_broker_client.c
@@ -44,6 +45,7 @@ in {
       ../tests/001-load.phpt
       ../tests/fixtures/class-linking.php
       ../tests/fixtures/concurrent.php
+      ../tests/fixtures/jit-function.php
       ../tests/fixtures/persistent.php
       ../tests/fixtures/phpstan-source.php
       ../tests/integration/broker-stall.c
@@ -51,6 +53,8 @@ in {
       ../tests/integration/cache-create.php
       ../tests/integration/class-linking-attach.php
       ../tests/integration/class-linking-create.php
+      ../tests/integration/jit-function-attach.php
+      ../tests/integration/jit-function-create.php
       ../tests/integration/phpstan-worker-bootstrap.php
       ../tests/integration/phpstan.neon
     ];

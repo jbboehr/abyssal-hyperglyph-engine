@@ -49,12 +49,15 @@ tracing-JIT cache. The two AHE modes use separate brokers so their different
 allocation sizes and OPcache configurations never contend for the prototype
 broker's single generation.
 
-Whole-function JIT is intentionally process-local in this matrix. Its
-compile-on-script-load machine code currently crashes independently attached
-PHPStan workers after they receive work, while the equivalent process-local
-workers complete. AHE must not advertise or benchmark that combination until
-its additional process-local JIT state is identified and reinitialized during
-reattachment.
+Whole-function JIT remains process-local in this six-mode matrix so the recorded
+historical runs stay comparable. AHE's retained whole-function compatibility is
+now covered separately: the JIT reattachment patch applies PHP's
+internal-function address guards to every reattachment-capable build, a reduced
+creator/attacher check executes retained PHAR-backed machine code, and the
+pinned PHPUnit analysis completes with one attached parent and eight attached
+workers. The next benchmark revision should add a seventh
+`ahe-jit-function` mode and replace the six-row counterbalance with a complete
+seven-row block before recording performance claims.
 
 The benchmark reports two independent PHPStan result-cache states:
 
