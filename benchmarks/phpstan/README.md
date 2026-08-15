@@ -10,7 +10,7 @@ Run it from the development shell:
 
 ```console
 nix develop
-scripts/benchmark-phpstan.sh --samples 6
+scripts/benchmark-phpstan.sh --samples 7
 ```
 
 This also provides real-world regression coverage for cross-process class
@@ -32,7 +32,7 @@ Completed development measurements and their interpretation are recorded in
 
 ## Cache controls
 
-The harness runs six modes with the same patched PHP binary and extension set:
+The harness runs seven modes with the same patched PHP binary and extension set:
 
 - `vanilla`: CLI OPcache disabled;
 - `opcache`: ordinary process-local CLI OPcache;
@@ -41,23 +41,17 @@ The harness runs six modes with the same patched PHP binary and extension set:
   compile-on-script-load JIT preset;
 - `ahe`: broker-retained OPcache with JIT disabled;
 - `ahe-jit`: a separately broker-retained generation with the same JIT profile
-  as `opcache-jit`.
+  as `opcache-jit`;
+- `ahe-jit-function`: a third broker-retained generation with the same
+  whole-function JIT profile as `opcache-jit-function`.
 
 The process-local JIT modes isolate each JIT strategy's effect from persistence.
 Comparing `ahe-jit` with `opcache-jit` isolates the effect of retaining a
-tracing-JIT cache. The two AHE modes use separate brokers so their different
-allocation sizes and OPcache configurations never contend for the prototype
-broker's single generation.
-
-Whole-function JIT remains process-local in this six-mode matrix so the recorded
-historical runs stay comparable. AHE's retained whole-function compatibility is
-now covered separately: the JIT reattachment patch applies PHP's
-internal-function address guards to every reattachment-capable build, a reduced
-creator/attacher check executes retained PHAR-backed machine code, and the
-pinned PHPUnit analysis completes with one attached parent and eight attached
-workers. The next benchmark revision should add a seventh
-`ahe-jit-function` mode and replace the six-row counterbalance with a complete
-seven-row block before recording performance claims.
+tracing-JIT cache; comparing `ahe-jit-function` with
+`opcache-jit-function` isolates the effect of retaining whole-function JIT.
+The three AHE modes use separate brokers so their different allocation sizes and
+OPcache configurations never contend for the prototype broker's single
+generation.
 
 The benchmark reports two independent PHPStan result-cache states:
 
@@ -66,10 +60,10 @@ The benchmark reports two independent PHPStan result-cache states:
   analysis.
 
 PHPStan's generated dependency-injection container remains warm and at the same
-path throughout, so it is not confused with the result cache. A balanced
-Latin-square order puts every mode in every execution position and varies its
-neighbors to reduce ordering and carryover bias. Sample counts must be a
-multiple of the six modes so the harness always executes complete
+path throughout, so it is not confused with the result cache. A Latin-square
+order puts every mode in every execution position and varies its neighbors to
+reduce ordering and carryover bias. Sample counts must be a
+multiple of the seven modes so the harness always executes complete
 counterbalancing blocks. Each AHE generation is primed with a complete,
 result-cache-cold analysis before sample collection; these cache-populating
 invocations are timed and reported separately rather than mixed with attached
@@ -86,8 +80,9 @@ must produce a fresh parent marker before it can be recorded. A post-sample
 probe additionally compares the retained JIT buffer with a baseline captured
 after startup allocated its stub handlers but before PHPStan ran. It therefore
 requires workload-generated JIT code rather than treating startup allocation as
-emission. These guards prevent configuration drift, result-cache invalidation,
-and process-local fallback from distorting the comparison.
+emission and records the remaining capacity so a saturated JIT buffer is
+visible in the artifact. These guards prevent configuration drift, result-cache
+invalidation, and process-local fallback from distorting the comparison.
 
 PHPStan runs its engine from a PHAR. With PHP 8.4's normal OPcache settings,
 timestamp and file-update checks cannot obtain a timestamp for internal PHAR

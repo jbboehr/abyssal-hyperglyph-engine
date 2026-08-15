@@ -12,8 +12,9 @@ readonly -a benchmark_modes=(
   opcache-jit-function
   ahe
   ahe-jit
+  ahe-jit-function
 )
-readonly -a balanced_mode_offsets=(0 1 5 2 4 3)
+readonly -a balanced_mode_offsets=(0 1 6 2 5 3 4)
 readonly counterbalance_block_size=${#benchmark_modes[@]}
 
 usage() {
@@ -22,12 +23,12 @@ Usage: scripts/benchmark-phpstan.sh [--samples COUNT]
 
 Benchmark vanilla PHP, process-local OPcache, and AHE, with and without JIT,
 on PHPUnit's PHPStan analysis.
-The sample count must be a multiple of 6. The default is
-AHE_BENCHMARK_SAMPLES or 6.
+The sample count must be a multiple of 7. The default is
+AHE_BENCHMARK_SAMPLES or 7.
 EOF
 }
 
-samples=${AHE_BENCHMARK_SAMPLES:-6}
+samples=${AHE_BENCHMARK_SAMPLES:-7}
 while (($#)); do
   case $1 in
     --samples)
@@ -156,6 +157,7 @@ fi
 runtime_directory=$(mktemp -d /tmp/ahe-phpstan-benchmark.XXXXXX)
 broker_socket="$runtime_directory/ahe-broker.sock"
 jit_broker_socket="$runtime_directory/ahe-jit-broker.sock"
+function_jit_broker_socket="$runtime_directory/ahe-jit-function-broker.sock"
 phpstan_tmp_directory="$runtime_directory/phpstan-tmp"
 result_cache="$phpstan_tmp_directory/phpstan/phpunit-12.5.php"
 result_cache_snapshot="$runtime_directory/phpunit-12.5.snapshot.php"
@@ -164,6 +166,7 @@ samples_file="$result_directory/samples.tsv"
 primes_file="$result_directory/primes.tsv"
 declare -a broker_pids=()
 ahe_jit_startup_buffer_free=
+ahe_jit_function_startup_buffer_free=
 
 cleanup() {
   local broker_pid
@@ -181,7 +184,7 @@ trap cleanup EXIT
 declare -a analysis_command
 
 mode_uses_ahe() {
-  [[ "$1" == ahe || "$1" == ahe-jit ]]
+  [[ "$1" == ahe || "$1" == ahe-jit || "$1" == ahe-jit-function ]]
 }
 
 build_analysis_command() {
@@ -254,6 +257,21 @@ build_analysis_command() {
         AHE_BENCHMARK_EXPECT_ATTACHMENT=1
       )
       ;;
+    ahe-jit-function)
+      if [[ -z "$attachment_directory" ]]; then
+        echo "An AHE analysis requires a fresh attachment-marker directory." >&2
+        return 2
+      fi
+      mkdir "$attachment_directory"
+      mode_php_ini_scan_path=$function_jit_php_ini_scan_path
+      expect_jit_mode=function
+      analysis_command+=(
+        "AHE_BROKER_SOCKET=$function_jit_broker_socket"
+        "AHE_CACHE_NAMESPACE=phpunit-$phpunit_commit-jit-function"
+        "AHE_BENCHMARK_ATTACHMENT_DIRECTORY=$attachment_directory"
+        AHE_BENCHMARK_EXPECT_ATTACHMENT=1
+      )
+      ;;
     *)
       printf 'Unknown benchmark mode: %s\n' "$mode" >&2
       return 2
@@ -313,6 +331,13 @@ verify_ahe_cache() {
       mode_php_ini_scan_path=$tracing_jit_php_ini_scan_path
       expect_jit_mode=tracing
       jit_startup_buffer_free=$ahe_jit_startup_buffer_free
+      ;;
+    ahe-jit-function)
+      mode_broker_socket=$function_jit_broker_socket
+      mode_cache_namespace=phpunit-$phpunit_commit-jit-function
+      mode_php_ini_scan_path=$function_jit_php_ini_scan_path
+      expect_jit_mode=function
+      jit_startup_buffer_free=$ahe_jit_function_startup_buffer_free
       ;;
     *)
       printf 'Cannot verify a non-AHE benchmark mode: %s\n' "$mode" >&2
@@ -401,7 +426,7 @@ run_timed() {
   printf '%s\t%s\t%s\t%s\t%s\n' \
     "$cache_state" "$mode" "$iteration" "$elapsed_seconds" "$max_rss_kb" \
     >>"$samples_file"
-  printf '%-4s %-12s sample %s: %ss, %s KiB max RSS\n' \
+  printf '%-4s %-20s sample %s: %ss, %s KiB max RSS\n' \
     "$cache_state" "$mode" "$iteration" "$elapsed_seconds" "$max_rss_kb"
 }
 
@@ -539,6 +564,12 @@ start_broker() {
 }
 
 capture_ahe_jit_startup_baseline() {
+  local output_variable=$1
+  local label=$2
+  local socket=$3
+  local cache_namespace=$4
+  local php_ini_scan_path=$5
+  local expected_jit_mode=$6
   local buffer_free
 
   # This first client creates an otherwise empty retained generation. Measuring
@@ -547,19 +578,22 @@ capture_ahe_jit_startup_baseline() {
   # The single-quoted program is PHP, not shell source.
   # shellcheck disable=SC2016
   if ! buffer_free=$(env \
-    "AHE_BROKER_SOCKET=$jit_broker_socket" \
-    "AHE_CACHE_NAMESPACE=phpunit-$phpunit_commit-jit" \
-    "PHP_INI_SCAN_DIR=$tracing_jit_php_ini_scan_path" \
+    "AHE_BENCHMARK_EXPECT_JIT_MODE=$expected_jit_mode" \
+    "AHE_BROKER_SOCKET=$socket" \
+    "AHE_CACHE_NAMESPACE=$cache_namespace" \
+    "PHP_INI_SCAN_DIR=$php_ini_scan_path" \
     "$ahe_php" \
     -d "sys_temp_dir='$phpstan_tmp_directory'" \
     -r '
       $status = opcache_get_status(false);
       $jit = is_array($status) ? ($status["jit"] ?? null) : null;
       $maps = file_get_contents("/proc/self/maps");
+      $actualJitMode = strtolower((string) ini_get("opcache.jit"));
+      $expectedJitMode = (string) getenv("AHE_BENCHMARK_EXPECT_JIT_MODE");
       if (!is_array($jit)
           || ($jit["enabled"] ?? false) !== true
           || ($jit["on"] ?? false) !== true
-          || strtolower((string) ini_get("opcache.jit")) !== "tracing"
+          || $actualJitMode !== $expectedJitMode
           || !is_int($jit["buffer_size"] ?? null)
           || !is_int($jit["buffer_free"] ?? null)
           || $jit["buffer_free"] <= 0
@@ -567,7 +601,7 @@ capture_ahe_jit_startup_baseline() {
           || $maps === false
           || !str_contains($maps, "/memfd:ahe-opcache")
       ) {
-          fwrite(STDERR, "Could not capture the attached tracing-JIT startup baseline.\n");
+          fwrite(STDERR, "Could not capture the attached JIT startup baseline.\n");
           exit(1);
       }
       echo $jit["buffer_free"];
@@ -576,20 +610,35 @@ capture_ahe_jit_startup_baseline() {
     return 1
   fi
   if [[ ! "$buffer_free" =~ ^[0-9]+$ ]]; then
-    printf 'The tracing-JIT startup baseline is not an integer: %s\n' "$buffer_free" >&2
+    printf 'The %s startup baseline is not an integer: %s\n' \
+      "$label" "$buffer_free" >&2
     return 1
   fi
 
-  ahe_jit_startup_buffer_free=$buffer_free
-  printf '%s\n' "$ahe_jit_startup_buffer_free" \
-    >"$result_directory/ahe-jit-startup-buffer-free.txt"
-  printf 'ahe_jit_startup_buffer_free=%s\n' "$ahe_jit_startup_buffer_free" \
+  printf -v "$output_variable" '%s' "$buffer_free"
+  printf '%s\n' "$buffer_free" \
+    >"$result_directory/$label-startup-buffer-free.txt"
+  printf '%s=%s\n' "$output_variable" "$buffer_free" \
     >>"$result_directory/metadata.txt"
 }
 
 start_broker ahe "$broker_socket"
 start_broker ahe-jit "$jit_broker_socket"
-capture_ahe_jit_startup_baseline
+start_broker ahe-jit-function "$function_jit_broker_socket"
+capture_ahe_jit_startup_baseline \
+  ahe_jit_startup_buffer_free \
+  ahe-jit \
+  "$jit_broker_socket" \
+  "phpunit-$phpunit_commit-jit" \
+  "$tracing_jit_php_ini_scan_path" \
+  tracing
+capture_ahe_jit_startup_baseline \
+  ahe_jit_function_startup_buffer_free \
+  ahe-jit-function \
+  "$function_jit_broker_socket" \
+  "phpunit-$phpunit_commit-jit-function" \
+  "$function_jit_php_ini_scan_path" \
+  function
 
 echo "Priming PHPStan's generated container and result cache..."
 if ! run_analysis vanilla '' >"$result_directory/result-cache-prime.log" 2>&1; then
@@ -673,12 +722,14 @@ warm_ahe_generation_for_result_cache() {
 echo "Priming the retained AHE generations with result-cache-cold analyses..."
 run_ahe_prime ahe
 run_ahe_prime ahe-jit
+run_ahe_prime ahe-jit-function
 
 for cache_state in cold warm; do
   if [[ "$cache_state" == warm ]]; then
     echo "Warming the retained generations for PHPStan result-cache reuse..."
     warm_ahe_generation_for_result_cache ahe
     warm_ahe_generation_for_result_cache ahe-jit
+    warm_ahe_generation_for_result_cache ahe-jit-function
   fi
   for ((iteration = 1; iteration <= samples; iteration++)); do
     for ((order_index = 0; order_index < ${#benchmark_modes[@]}; order_index++)); do
@@ -721,6 +772,8 @@ comparison_from=(
   ahe
   opcache-jit
   opcache-jit
+  opcache-jit-function
+  ahe
 )
 comparison_to=(
   opcache
@@ -730,6 +783,8 @@ comparison_to=(
   ahe-jit
   ahe-jit
   opcache-jit-function
+  ahe-jit-function
+  ahe-jit-function
 )
 comparisons_file="$result_directory/comparisons.tsv"
 printf 'result_cache\tbaseline_mode\tcandidate_mode\tspeedup_percent\n' >"$comparisons_file"

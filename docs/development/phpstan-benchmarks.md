@@ -198,13 +198,57 @@ All completed without process-local fallback or a crash. The reduced fixture
 provides focused retained-code coverage, while the pinned PHPUnit run is the
 end-to-end regression that demonstrably failed before the patch.
 
-## Next slice: benchmark retained whole-function JIT
+## 2026-08-15 22:57 UTC: retained whole-function-JIT matrix
 
-The current benchmark remains a six-mode historical matrix and therefore does
-not yet time AHE plus function JIT. Add an `ahe-jit-function` mode with its own
-broker generation, change sampling to complete seven-row counterbalancing
-blocks, and rerun both cold and warm PHPStan result-cache states. The retained
-mode must keep the existing per-process attachment, exact-JIT-mode, emitted-code,
-and cache-health assertions. This will determine whether retaining eagerly
-compiled functions recovers enough of the severe process-local function-JIT
-startup cost to be useful.
+Artifact ID: `20260815T225758Z`
+
+This exploratory run added `ahe-jit-function` with its own broker generation and
+used one complete seven-row counterbalancing block. Every mode occupied every
+execution position once in each result-cache state. All 98 timed samples, the
+three retained-generation primes, and the warm-result-cache transitions passed
+their applicable attachment, exact-JIT-mode, emitted-code, and cache-health
+checks.
+
+Metadata recorded PHP 8.4.24, PHPStan 2.2.6, AHE revision
+`5e0c69a5ae918e80c3226e17881fec5d55f4cc5a`, Linux 7.1.5-xanmod1, and an AMD
+Ryzen 9 9950X3D. The worktree was dirty because it contained the seven-mode
+harness changes. Other host activity may have added timing noise, so medians and
+large differences are more meaningful than sub-percent comparisons.
+
+| Result cache | Mode | Median time | Median max RSS | Speedup versus vanilla |
+| --- | --- | ---: | ---: | ---: |
+| cold | vanilla | 4.350 s | 198,720 KiB | — |
+| cold | process-local OPcache | 4.431 s | 233,744 KiB | -1.9% |
+| cold | process-local tracing JIT | 5.235 s | 271,684 KiB | -20.3% |
+| cold | process-local function JIT | 11.951 s | 329,920 KiB | -174.7% |
+| cold | AHE | 3.688 s | 232,556 KiB | 15.2% |
+| cold | AHE plus tracing JIT | 3.878 s | 252,444 KiB | 10.9% |
+| cold | AHE plus function JIT | 2.892 s | 291,948 KiB | 33.5% |
+| warm | vanilla | 0.298 s | 161,952 KiB | — |
+| warm | process-local OPcache | 0.510 s | 182,040 KiB | -71.1% |
+| warm | process-local tracing JIT | 0.614 s | 215,796 KiB | -106.0% |
+| warm | process-local function JIT | 3.927 s | 254,468 KiB | -1217.8% |
+| warm | AHE | 0.284 s | 134,508 KiB | 4.7% |
+| warm | AHE plus tracing JIT | 0.272 s | 153,048 KiB | 8.7% |
+| warm | AHE plus function JIT | 0.286 s | 171,360 KiB | 4.0% |
+
+Retaining whole-function JIT removed most of its repeated compilation cost. It
+was 75.8% faster than process-local function JIT with a cold result cache and
+92.7% faster with a warm result cache. Against retained AHE without JIT, it was
+21.6% faster cold and effectively tied warm (`-0.7%`, well below the precision
+justified by this run). Its one-time retained-generation prime took 7.187 s,
+compared with 4.213 s for AHE and 4.333 s for AHE plus tracing JIT.
+
+The speed comes with a memory tradeoff. AHE plus function JIT used 291,948 KiB
+median max RSS cold, 25.5% more than AHE, and 171,360 KiB warm, 27.4% more than
+AHE. It still used 11.5% less cold and 32.7% less warm memory than process-local
+function JIT.
+
+The retained function-JIT generation exhausted its 64 MiB JIT buffer during the
+prime and reported zero free bytes afterward. The tracing generation consumed
+only about 1 MiB beyond startup. The function-JIT result therefore measures a
+matched, 64 MiB-capped configuration: it proves that retaining generated code
+avoids the severe per-process compilation penalty, but not that every eligible
+PHPStan function was compiled. A follow-up should sweep larger JIT buffers on a
+quiet host and report both saturation and timing before choosing a recommended
+PHPStan profile.
