@@ -1,0 +1,588 @@
+diff --git a/ext/opcache/ZendAccelerator.c b/ext/opcache/ZendAccelerator.c
+index a2d964c..30a93e0 100644
+--- a/ext/opcache/ZendAccelerator.c
++++ b/ext/opcache/ZendAccelerator.c
+@@ -3213,6 +3213,7 @@ static zend_result accel_post_startup(void)
+ {
+ 	zend_function *func;
+ 	zend_ini_entry *ini_entry;
++	bool reattached = false;
+ 
+ 	if (orig_post_startup_cb) {
+ 		zend_result (*cb)(void) = orig_post_startup_cb;
+@@ -3231,7 +3232,6 @@ static zend_result accel_post_startup(void)
+ 		size_t shm_size = ZCG(accel_directives).memory_consumption;
+ #ifdef HAVE_JIT
+ 		size_t jit_size = 0;
+-		bool reattached = false;
+ 
+ 		if (JIT_G(enabled) && JIT_G(buffer_size)
+ 		 && zend_jit_check_support() == SUCCESS) {
+@@ -3253,6 +3253,9 @@ static zend_result accel_post_startup(void)
+ #endif
+ 			case ALLOC_SUCCESS:
+ 				if (zend_accel_init_shm() == FAILURE) {
++					zend_shared_alloc_provider_startup_aborted(
++						"OPcache shared globals could not be initialized"
++					);
+ 					accel_startup_ok = false;
+ 					return FAILURE;
+ 				}
+@@ -3262,9 +3265,7 @@ static zend_result accel_post_startup(void)
+ 				zend_accel_error_noreturn(ACCEL_LOG_FATAL, "Failure to initialize shared memory structures - probably not enough shared memory.");
+ 				return SUCCESS;
+ 			case SUCCESSFULLY_REATTACHED:
+-#ifdef HAVE_JIT
+ 				reattached = true;
+-#endif
+ 				zend_shared_alloc_lock();
+ 				accel_shared_globals = (zend_accel_shared_globals *) ZSMMG(app_shared_globals);
+ 				zend_interned_strings_set_request_storage_handlers(
+@@ -3274,6 +3275,9 @@ static zend_result accel_post_startup(void)
+ 				zend_shared_alloc_unlock();
+ 				break;
+ 			case FAILED_REATTACHED:
++				zend_shared_alloc_provider_startup_aborted(
++					"OPcache could not reattach the external shared memory"
++				);
+ 				accel_startup_ok = false;
+ 				zend_accel_error_noreturn(ACCEL_LOG_FATAL, "Failure to initialize shared memory structures - cannot reattach to exiting shared memory.");
+ 				return SUCCESS;
+@@ -3376,6 +3380,9 @@ static zend_result accel_post_startup(void)
+ 	}
+ 
+ 	if (accel_finish_startup() != SUCCESS) {
++		zend_shared_alloc_provider_startup_aborted(
++			"OPcache could not finish startup"
++		);
+ 		return FAILURE;
+ 	}
+ 
+@@ -3387,6 +3394,8 @@ static zend_result accel_post_startup(void)
+ 		zend_inheritance_cache_add = zend_accel_inheritance_cache_add;
+ 	}
+ 
++	zend_shared_alloc_provider_startup_complete(reattached);
++
+ 	return SUCCESS;
+ }
+ 
+diff --git a/ext/opcache/zend_shared_alloc.c b/ext/opcache/zend_shared_alloc.c
+index 8516493..33a0f11 100644
+--- a/ext/opcache/zend_shared_alloc.c
++++ b/ext/opcache/zend_shared_alloc.c
+@@ -52,6 +52,12 @@
+    is wrapped with exclusive lock anyway */
+ static const zend_shared_memory_handlers *g_shared_alloc_handler = NULL;
+ static const char *g_shared_model;
++static zend_opcache_shm_provider_v1 g_shared_alloc_provider;
++static bool g_shared_alloc_provider_registered = false;
++static bool g_shared_alloc_provider_active = false;
++static bool g_shared_alloc_provider_startup_finished = false;
++static bool g_shared_alloc_started = false;
++static void *g_shared_alloc_provider_reattached_globals = NULL;
+ /* pointer to globals allocated in SHM and shared across processes */
+ ZEND_EXT_API zend_smm_shared_globals *smm_shared_globals;
+ 
+@@ -63,6 +69,126 @@ int lock_file = -1;
+ static char lockfile_name[MAXPATHLEN];
+ #endif
+ 
++static bool zend_shared_alloc_provider_segments_are_valid(
++	zend_shared_segment **shared_segments,
++	int shared_segment_count
++)
++{
++	int i;
++
++	if (!shared_segments || shared_segment_count <= 0) {
++		return false;
++	}
++
++	for (i = 0; i < shared_segment_count; i++) {
++		zend_shared_segment *segment = shared_segments[i];
++
++		if (!segment || !segment->p || segment->p == (void *) -1 || !segment->size) {
++			return false;
++		}
++	}
++
++	return true;
++}
++
++static bool zend_shared_alloc_provider_segment_contains(
++	zend_shared_segment *segment,
++	void *address,
++	size_t size
++)
++{
++	uintptr_t start = (uintptr_t) segment->p;
++	uintptr_t candidate = (uintptr_t) address;
++
++	return candidate >= start
++		&& candidate - start <= segment->size
++		&& size <= segment->size - (candidate - start);
++}
++
++static int zend_shared_alloc_provider_create_segments(
++	size_t requested_size,
++	zend_shared_segment ***shared_segments,
++	int *shared_segment_count,
++	const char **error_in
++)
++{
++	int result;
++
++	g_shared_alloc_provider_reattached_globals = NULL;
++	result = g_shared_alloc_provider.create_segments(
++		g_shared_alloc_provider.context,
++		requested_size,
++		shared_segments,
++		shared_segment_count,
++		&g_shared_alloc_provider_reattached_globals,
++		error_in
++	);
++
++	switch (result) {
++		case ALLOC_FAILURE:
++		case FAILED_REATTACHED:
++			return result;
++		case ALLOC_SUCCESS:
++			if (zend_shared_alloc_provider_segments_are_valid(
++				*shared_segments,
++				*shared_segment_count
++			)) {
++				return result;
++			}
++			*error_in = "external provider returned invalid shared memory segments";
++			return ALLOC_FAILURE;
++		case SUCCESSFULLY_REATTACHED:
++			if (zend_shared_alloc_provider_segments_are_valid(
++				*shared_segments,
++				*shared_segment_count
++			)
++			 && g_shared_alloc_provider_reattached_globals) {
++				int i;
++
++				for (i = 0; i < *shared_segment_count; i++) {
++					zend_shared_segment *segment = (*shared_segments)[i];
++
++					if (zend_shared_alloc_provider_segment_contains(
++						segment,
++						g_shared_alloc_provider_reattached_globals,
++						sizeof(zend_smm_shared_globals)
++					)) {
++						return result;
++					}
++				}
++			}
++			*error_in = "external provider returned invalid reattached shared globals";
++			return ALLOC_FAILURE;
++		default:
++			*error_in = "external provider returned an unsupported allocation status";
++			return ALLOC_FAILURE;
++	}
++}
++
++static int zend_shared_alloc_provider_detach_segment(zend_shared_segment *shared_segment)
++{
++	return g_shared_alloc_provider.detach_segment(
++		g_shared_alloc_provider.context,
++		shared_segment
++	);
++}
++
++static size_t zend_shared_alloc_provider_segment_type_size(void)
++{
++	return g_shared_alloc_provider.segment_type_size(g_shared_alloc_provider.context);
++}
++
++static const zend_shared_memory_handlers provider_handlers = {
++	zend_shared_alloc_provider_create_segments,
++	zend_shared_alloc_provider_detach_segment,
++	zend_shared_alloc_provider_segment_type_size,
++};
++
++static const zend_shared_memory_handler_entry provider_handler_entry = {
++	"external",
++	&provider_handlers,
++};
++
+ static const zend_shared_memory_handler_entry handler_table[] = {
+ #ifdef USE_MMAP
+ 	{ "mmap", &zend_alloc_mmap_handlers },
+@@ -79,6 +205,30 @@ static const zend_shared_memory_handler_entry handler_table[] = {
+ 	{ NULL, NULL}
+ };
+ 
++ZEND_EXT_API int zend_opcache_register_shared_memory_provider_v1(
++	const zend_opcache_shm_provider_v1 *provider
++)
++{
++#if defined(ZTS) || defined(ZEND_WIN32)
++	(void) provider;
++	return ZEND_OPCACHE_SHM_PROVIDER_FAILURE;
++#else
++	if (g_shared_alloc_started || g_shared_alloc_provider_registered || !provider
++	 || provider->abi_version != ZEND_OPCACHE_SHM_PROVIDER_ABI_V1
++	 || provider->struct_size < sizeof(zend_opcache_shm_provider_v1)
++	 || !provider->name || !provider->name[0]
++	 || !provider->create_segments || !provider->detach_segment
++	 || !provider->segment_type_size || !provider->lock || !provider->unlock
++	 || provider->segment_type_size(provider->context) < sizeof(zend_shared_segment)) {
++		return ZEND_OPCACHE_SHM_PROVIDER_FAILURE;
++	}
++
++	g_shared_alloc_provider = *provider;
++	g_shared_alloc_provider_registered = true;
++	return ZEND_OPCACHE_SHM_PROVIDER_SUCCESS;
++#endif
++}
++
+ #ifndef ZEND_WIN32
+ void zend_shared_alloc_create_lock(char *lockfile_path)
+ {
+@@ -149,7 +299,9 @@ static int zend_shared_alloc_try(const zend_shared_memory_handler_entry *he, siz
+ {
+ 	int res;
+ 	g_shared_alloc_handler = he->handler;
+-	g_shared_model = he->name;
++	g_shared_model = he == &provider_handler_entry
++		? g_shared_alloc_provider.name
++		: he->name;
+ 	ZSMMG(shared_segments) = NULL;
+ 	ZSMMG(shared_segments_count) = 0;
+ 
+@@ -171,6 +323,7 @@ static int zend_shared_alloc_try(const zend_shared_memory_handler_entry *he, siz
+ 		*shared_segments_p = NULL;
+ 	}
+ 	g_shared_alloc_handler = NULL;
++	g_shared_model = NULL;
+ 	return ALLOC_FAILURE;
+ }
+ 
+@@ -184,19 +337,40 @@ int zend_shared_alloc_startup(size_t requested_size, size_t reserved_size)
+ 	int res = ALLOC_FAILURE;
+ 	int i;
+ 
++	g_shared_alloc_started = true;
++
+ 	/* shared_free must be valid before we call zend_shared_alloc()
+ 	 * - make it temporarily point to a local variable
+ 	 */
+ 	smm_shared_globals = &tmp_shared_globals;
+ 	ZSMMG(shared_free) = requested_size - reserved_size; /* goes to tmp_shared_globals.shared_free */
+ 
++	if (g_shared_alloc_provider_registered) {
++		res = zend_shared_alloc_try(
++			&provider_handler_entry,
++			requested_size,
++			&ZSMMG(shared_segments),
++			&ZSMMG(shared_segments_count),
++			&error_in
++		);
++		if (res) {
++			g_shared_alloc_provider_active = true;
++			g_shared_alloc_provider_startup_finished = false;
++		} else if (g_shared_alloc_provider.shutdown) {
++			g_shared_alloc_provider.shutdown(g_shared_alloc_provider.context);
++		}
++	}
++
++	if (!g_shared_alloc_handler) {
+ #ifndef ZEND_WIN32
+-	zend_shared_alloc_create_lock(ZCG(accel_directives).lockfile_path);
++		zend_shared_alloc_create_lock(ZCG(accel_directives).lockfile_path);
+ #else
+-	zend_shared_alloc_create_lock();
++		zend_shared_alloc_create_lock();
+ #endif
++	}
+ 
+-	if (ZCG(accel_directives).memory_model && ZCG(accel_directives).memory_model[0]) {
++	if (!g_shared_alloc_handler
++	 && ZCG(accel_directives).memory_model && ZCG(accel_directives).memory_model[0]) {
+ 		const char *model = ZCG(accel_directives).memory_model;
+ 		/* "cgi" is really "shm"... */
+ 		if (strncmp(ZCG(accel_directives).memory_model, "cgi", sizeof("cgi")) == 0) {
+@@ -244,0 +419,2 @@ int zend_shared_alloc_startup(size_t requested_size, size_t reserved_size)
++		smm_shared_globals = (zend_smm_shared_globals *)
++			g_shared_alloc_provider_reattached_globals;
+@@ -304,14 +480,52 @@ int zend_shared_alloc_startup(size_t requested_size, size_t reserved_size)
+ 	return res;
+ }
+ 
++void zend_shared_alloc_provider_startup_complete(bool reattached)
++{
++	if (!g_shared_alloc_provider_active || g_shared_alloc_provider_startup_finished) {
++		return;
++	}
++
++	if (g_shared_alloc_provider.startup_complete) {
++		g_shared_alloc_provider.startup_complete(
++			g_shared_alloc_provider.context,
++			reattached,
++			smm_shared_globals
++		);
++	}
++	g_shared_alloc_provider_startup_finished = true;
++}
++
++void zend_shared_alloc_provider_startup_aborted(const char *reason)
++{
++	if (!g_shared_alloc_provider_active || g_shared_alloc_provider_startup_finished) {
++		return;
++	}
++
++	if (g_shared_alloc_provider.startup_aborted) {
++		g_shared_alloc_provider.startup_aborted(
++			g_shared_alloc_provider.context,
++			reason
++		);
++	}
++	g_shared_alloc_provider_startup_finished = true;
++}
++
+ void zend_shared_alloc_shutdown(void)
+ {
+ 	zend_shared_segment **tmp_shared_segments;
+ 	zend_shared_segment *shared_segments_buf[16];
+ 	size_t shared_segments_array_size;
+ 	zend_smm_shared_globals tmp_shared_globals;
++	bool provider_active = g_shared_alloc_provider_active;
+ 	int i;
+ 
++	if (provider_active && !g_shared_alloc_provider_startup_finished) {
++		zend_shared_alloc_provider_startup_aborted(
++			"OPcache shut down before shared-memory startup completed"
++		);
++	}
++
+ 	tmp_shared_globals = *smm_shared_globals;
+ 	smm_shared_globals = &tmp_shared_globals;
+ 	shared_segments_array_size = ZSMMG(shared_segments_count) * (S_H(segment_type_size)() + sizeof(void *));
+@@ -331,8 +545,16 @@ void zend_shared_alloc_shutdown(void)
+ 	}
+ 	ZSMMG(shared_segments) = NULL;
+ 	g_shared_alloc_handler = NULL;
++	g_shared_model = NULL;
++	if (provider_active && g_shared_alloc_provider.shutdown) {
++		g_shared_alloc_provider.shutdown(g_shared_alloc_provider.context);
++	}
++	g_shared_alloc_provider_active = false;
+ #ifndef ZEND_WIN32
+-	close(lock_file);
++	if (!provider_active && lock_file >= 0) {
++		close(lock_file);
++		lock_file = -1;
++	}
+ 
+ # ifdef ZTS
+ 	tsrm_mutex_free(zts_lock);
+@@ -482,16 +704,26 @@ void zend_shared_alloc_lock(void)
+ {
+ 	ZEND_ASSERT(!ZCG(locked));
+ 
++	if (g_shared_alloc_provider_active) {
++		if (g_shared_alloc_provider.lock(g_shared_alloc_provider.context)
++		 != ZEND_OPCACHE_SHM_PROVIDER_SUCCESS) {
++			zend_accel_error_noreturn(
++				ACCEL_LOG_ERROR,
++				"Cannot lock external shared-memory provider %s",
++				g_shared_alloc_provider.name
++			);
++		}
++	} else {
+ #ifndef ZEND_WIN32
+-	struct flock mem_write_lock;
++		struct flock mem_write_lock;
+ 
+-	mem_write_lock.l_type = F_WRLCK;
+-	mem_write_lock.l_whence = SEEK_SET;
+-	mem_write_lock.l_start = 0;
+-	mem_write_lock.l_len = 1;
++		mem_write_lock.l_type = F_WRLCK;
++		mem_write_lock.l_whence = SEEK_SET;
++		mem_write_lock.l_start = 0;
++		mem_write_lock.l_len = 1;
+ 
+ #ifdef ZTS
+-	tsrm_mutex_lock(zts_lock);
++		tsrm_mutex_lock(zts_lock);
+ #endif
+ 
+ #if 0
+@@ -501,18 +733,19 @@ void zend_shared_alloc_lock(void)
+ 	}
+ #endif
+ 
+-	while (1) {
+-		if (fcntl(lock_file, F_SETLKW, &mem_write_lock) == -1) {
+-			if (errno == EINTR) {
+-				continue;
++		while (1) {
++			if (fcntl(lock_file, F_SETLKW, &mem_write_lock) == -1) {
++				if (errno == EINTR) {
++					continue;
++				}
++				zend_accel_error_noreturn(ACCEL_LOG_ERROR, "Cannot create lock - %s (%d)", strerror(errno), errno);
+ 			}
+-			zend_accel_error_noreturn(ACCEL_LOG_ERROR, "Cannot create lock - %s (%d)", strerror(errno), errno);
++			break;
+ 		}
+-		break;
+-	}
+ #else
+-	zend_shared_alloc_lock_win32();
++		zend_shared_alloc_lock_win32();
+ #endif
++	}
+ 
+ 	ZCG(locked) = 1;
+ }
+@@ -532,16 +765,27 @@ void zend_shared_alloc_unlock(void)
+ 
+ 	ZCG(locked) = 0;
+ 
++	if (g_shared_alloc_provider_active) {
++		if (g_shared_alloc_provider.unlock(g_shared_alloc_provider.context)
++		 != ZEND_OPCACHE_SHM_PROVIDER_SUCCESS) {
++			zend_accel_error_noreturn(
++				ACCEL_LOG_ERROR,
++				"Cannot unlock external shared-memory provider %s",
++				g_shared_alloc_provider.name
++			);
++		}
++	} else {
+ #ifndef ZEND_WIN32
+-	if (fcntl(lock_file, F_SETLK, &mem_write_unlock) == -1) {
+-		zend_accel_error_noreturn(ACCEL_LOG_ERROR, "Cannot remove lock - %s (%d)", strerror(errno), errno);
+-	}
++		if (fcntl(lock_file, F_SETLK, &mem_write_unlock) == -1) {
++			zend_accel_error_noreturn(ACCEL_LOG_ERROR, "Cannot remove lock - %s (%d)", strerror(errno), errno);
++		}
+ #ifdef ZTS
+-	tsrm_mutex_unlock(zts_lock);
++		tsrm_mutex_unlock(zts_lock);
+ #endif
+ #else
+-	zend_shared_alloc_unlock_win32();
++		zend_shared_alloc_unlock_win32();
+ #endif
++	}
+ }
+ 
+ void zend_shared_alloc_init_xlat_table(void)
+diff --git a/ext/opcache/zend_shared_alloc.h b/ext/opcache/zend_shared_alloc.h
+index 41cba0b..28e1393 100644
+--- a/ext/opcache/zend_shared_alloc.h
++++ b/ext/opcache/zend_shared_alloc.h
+@@ -24,6 +24,7 @@
+ 
+ #include "zend.h"
+ #include "ZendAccelerator.h"
++#include "zend_shared_alloc_provider.h"
+ 
+ #if defined(__APPLE__) && defined(__MACH__) /* darwin */
+ # ifdef HAVE_SHM_MMAP_POSIX
+@@ -73,12 +74,7 @@
+ #define ALLOC_FAIL_MAPPING      8
+ #define ALLOC_FALLBACK          9
+ 
+-typedef struct _zend_shared_segment {
+-    size_t  size;
+-    size_t  end;
+-    size_t  pos;  /* position for simple stack allocator */
+-    void   *p;
+-} zend_shared_segment;
++typedef zend_opcache_shm_segment_v1 zend_shared_segment;
+ 
+ typedef int (*create_segments_t)(size_t requested_size, zend_shared_segment ***shared_segments, int *shared_segment_count, const char **error_in);
+ typedef int (*detach_segment_t)(zend_shared_segment *shared_segment);
+@@ -129,6 +125,12 @@ BEGIN_EXTERN_C()
+ 
+ int zend_shared_alloc_startup(size_t requested_size, size_t reserved_size);
+ void zend_shared_alloc_shutdown(void);
++void zend_shared_alloc_provider_startup_complete(bool reattached);
++void zend_shared_alloc_provider_startup_aborted(const char *reason);
++
++ZEND_EXT_API int zend_opcache_register_shared_memory_provider_v1(
++	const zend_opcache_shm_provider_v1 *provider
++);
+ 
+ /* allocate shared memory block */
+ void *zend_shared_alloc(size_t size);
+diff --git a/ext/opcache/zend_shared_alloc_provider.h b/ext/opcache/zend_shared_alloc_provider.h
+new file mode 100644
+index 0000000..6469df6
+--- /dev/null
++++ b/ext/opcache/zend_shared_alloc_provider.h
+@@ -0,0 +1,68 @@
++/*
++   +----------------------------------------------------------------------+
++   | Zend OPcache                                                         |
++   +----------------------------------------------------------------------+
++   | Copyright (c) The PHP Group                                          |
++   +----------------------------------------------------------------------+
++   | This source file is subject to version 3.01 of the PHP license,      |
++   | that is bundled with this package in the file LICENSE, and is        |
++   | available through the world-wide-web at the following url:           |
++   | https://www.php.net/license/3_01.txt                                 |
++   +----------------------------------------------------------------------+
++*/
++
++#ifndef ZEND_SHARED_ALLOC_PROVIDER_H
++#define ZEND_SHARED_ALLOC_PROVIDER_H
++
++#include <stddef.h>
++#include <stdint.h>
++
++#define ZEND_OPCACHE_SHM_PROVIDER_ABI_V1 1u
++#define ZEND_OPCACHE_SHM_PROVIDER_REGISTER_SYMBOL_V1 \
++	"zend_opcache_register_shared_memory_provider_v1"
++
++#define ZEND_OPCACHE_SHM_PROVIDER_SUCCESS 0
++#define ZEND_OPCACHE_SHM_PROVIDER_FAILURE -1
++
++#define ZEND_OPCACHE_SHM_ALLOC_FAILURE 0
++#define ZEND_OPCACHE_SHM_ALLOC_SUCCESS 1
++#define ZEND_OPCACHE_SHM_FAILED_REATTACHED 2
++#define ZEND_OPCACHE_SHM_SUCCESSFULLY_REATTACHED 4
++
++typedef struct _zend_shared_segment {
++	size_t size;
++	size_t end;
++	size_t pos;
++	void *p;
++} zend_opcache_shm_segment_v1;
++
++typedef struct _zend_opcache_shm_provider_v1 {
++	uint32_t abi_version;
++	uint32_t struct_size;
++	const char *name;
++	void *context;
++
++	int (*create_segments)(
++		void *context,
++		size_t requested_size,
++		zend_opcache_shm_segment_v1 ***shared_segments,
++		int *shared_segment_count,
++		void **reattached_shared_globals,
++		const char **error_in
++	);
++	int (*detach_segment)(void *context, zend_opcache_shm_segment_v1 *shared_segment);
++	size_t (*segment_type_size)(void *context);
++
++	int (*lock)(void *context);
++	int (*unlock)(void *context);
++
++	void (*startup_complete)(void *context, int reattached, void *shared_globals);
++	void (*startup_aborted)(void *context, const char *reason);
++	void (*shutdown)(void *context);
++} zend_opcache_shm_provider_v1;
++
++typedef int (*zend_opcache_register_shared_memory_provider_v1_t)(
++	const zend_opcache_shm_provider_v1 *provider
++);
++
++#endif /* ZEND_SHARED_ALLOC_PROVIDER_H */
