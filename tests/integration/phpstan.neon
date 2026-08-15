@@ -1,0 +1,8 @@
+parameters:
+    level: 0
+    tmpDir: %env.AHE_PHPSTAN_TMP_DIRECTORY%
+    parallel:
+        jobSize: 1
+        maximumNumberOfProcesses: 8
+        minimumNumberOfJobsPerProcess: 1
+        loadLimit: null

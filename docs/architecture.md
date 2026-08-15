@@ -12,7 +12,7 @@ The repository contains a PHP 8.4 patch that exports a version-two shared-memory
 
 When `AHE_BROKER_SOCKET` is set, the provider connects to `ahe-broker`, authenticates the peer and socket ownership, receives cache and lock `memfd` descriptors through `SCM_RIGHTS`, and maps the cache. The creator publishes its mapping base and shared allocator-globals offset only after OPcache finishes startup. A later process maps the same descriptor and address with `MAP_FIXED_NOREPLACE`, restores the allocator-globals pointer, and enters OPcache's existing `SUCCESSFULLY_REATTACHED` path.
 
-The integration checks deliberately abort one creator, build a replacement generation, reject size and layout mismatches, bound contention against the serial broker, recover an owned stale socket, verify prompt signal-driven shutdown, and prove that a final independent PHP invocation sees and hits the first successful process's cached script.
+The integration checks deliberately abort one creator, build a replacement generation, reject size and layout mismatches, recover an owned stale socket, verify prompt signal-driven shutdown, and prove that concurrent PHP processes can attach, race to populate one script under OPcache's write lock, and leave it available to a final independent invocation. A PHPStan 2.2 smoke test additionally forces its parallel scheduler to spawn workers and verifies from an autoload hook that the parent and every worker attached to the retained generation.
 
 The `ahe-php` launcher sets Linux's `ADDR_NO_RANDOMIZE` personality flag before executing PHP. AHE verifies the launcher contract during Zend startup. This is necessary because changing the personality after the PHP executable and extensions have been mapped cannot stabilize their addresses.
 
@@ -51,12 +51,19 @@ The existing shared-memory startup code already distinguishes a new allocation f
 - Fixed mappings must never replace an occupied range; use `MAP_FIXED_NOREPLACE` where available.
 - Clients may attach only after the creator publishes a ready state.
 - A creator crash during initialization must cause the incomplete generation to be discarded.
+- Once a generation is ready, the broker may serve clients concurrently; OPcache serializes shared-memory mutations through the common lock descriptor.
+- Every participant must start with the same loaded extension set and inherited `opcache.*` configuration.
+- `opcache.force_restart_timeout` must be zero: stock OPcache's forced-restart path terminates processes that still hold its request lock, but AHE's independent CLI participants are not replaceable FPM workers.
 - Broker and client credentials must match, and the socket and its parent directory must remain private to that user.
 - Failure to attach must degrade safely, initially to ordinary OPcache or its file cache.
 
 ## Initial implementation boundaries
 
-The functional prototype targets non-ZTS Linux and PHP 8.4 with JIT and preloading disabled. It is optimized for PHPStan rather than arbitrary untrusted CLI workloads. The current broker holds one ready generation, serves one connected client at a time, and relies on an explicitly supplied private socket path. A queued client waits for at most one second and then uses local OPcache; the broker does not yet provide concurrent shared-cache access. Sequential reuse, creator abort, configuration mismatch, contention fallback, safe stale-socket restart, and signal shutdown are covered. Generation retirement, complete loaded-module fingerprinting, deliberate address collisions, and scripts that inherit from internal classes still require dedicated coverage.
+The functional prototype targets non-ZTS Linux and PHP 8.4 with JIT and preloading disabled. It is optimized for PHPStan rather than arbitrary untrusted CLI workloads. The current broker holds one ready generation, multiplexes concurrent clients, and relies on an explicitly supplied private socket path. A second client that arrives while the first process is still constructing a cold generation is declined rather than queued; concurrent sharing begins only after the creator publishes `READY`.
+
+PHPStan's spawned workers inherit the broker environment, loaded ini, and ASLR-disabled process personality, so they can attach while the parent remains active. Parent-only `-d` values are not inherited. PHPStan 2.2 PHARs also inject their bundled Turbo extension into worker commands only; set `PHPSTAN_TURBO=0` until AHE fingerprints loaded modules and supports separate compatible generations. A future PHPStan-specific launcher should instead discover the bundled Turbo binary before starting PHP and load it through an inherited ini fragment, giving the parent and every worker the same module and address layout; loading it only in the parent with `-d extension=...` would not satisfy that contract.
+
+Sequential reuse, creator abort, configuration mismatch, concurrent attachment and population, PHPStan worker attachment, safe stale-socket restart, and signal shutdown are covered. Generation retirement, complete loaded-module fingerprinting, deliberate address collisions, and scripts that inherit from internal classes still require dedicated coverage.
 
 ## Patch maintenance
 

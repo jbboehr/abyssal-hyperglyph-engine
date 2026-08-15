@@ -21,6 +21,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <poll.h>
 #include <signal.h>
 #include <stdbool.h>
 #include <stddef.h>
@@ -51,6 +52,11 @@ typedef struct _ahe_generation {
 	uint64_t shared_globals_offset;
 	char cache_key[AHE_BROKER_CACHE_KEY_SIZE];
 } ahe_generation;
+
+typedef struct _ahe_broker_client_connection {
+	int fd;
+	bool handled_message;
+} ahe_broker_client_connection;
 
 static volatile sig_atomic_t ahe_broker_stopping = 0;
 
@@ -103,7 +109,7 @@ static int ahe_broker_send_message(
 	}
 
 	do {
-		sent = sendmsg(client_fd, &header, MSG_NOSIGNAL);
+		sent = sendmsg(client_fd, &header, MSG_DONTWAIT | MSG_NOSIGNAL);
 	} while (sent < 0 && errno == EINTR && !ahe_broker_stopping);
 
 	return sent == (ssize_t) sizeof(*message) ? 0 : -1;
@@ -114,7 +120,7 @@ static int ahe_broker_receive_message(int client_fd, ahe_broker_message_v1 *mess
 	ssize_t received;
 
 	do {
-		received = recv(client_fd, message, sizeof(*message), 0);
+		received = recv(client_fd, message, sizeof(*message), MSG_DONTWAIT);
 	} while (received < 0 && errno == EINTR && !ahe_broker_stopping);
 
 	if (received == 0) {
@@ -252,69 +258,106 @@ static int ahe_broker_handle_ready(
 		return ahe_broker_send_message(client_fd, &response, NULL, 0);
 	}
 
+	ahe_broker_message_init(&response, AHE_BROKER_ACK);
+	if (ahe_broker_send_message(client_fd, &response, NULL, 0) < 0) {
+		return -1;
+	}
+
 	generation->mapping_base = request->mapping_base;
 	generation->shared_globals_offset = request->shared_globals_offset;
 	generation->state = AHE_GENERATION_READY;
 	generation->creator_fd = -1;
-	ahe_broker_message_init(&response, AHE_BROKER_ACK);
-	return ahe_broker_send_message(client_fd, &response, NULL, 0);
+	return 0;
 }
 
-static bool ahe_broker_handle_client(int client_fd, ahe_generation *generation)
+static bool ahe_broker_handle_client_message(
+	ahe_broker_client_connection *client,
+	ahe_generation *generation
+)
 {
 	ahe_broker_message_v1 request;
 	ahe_broker_message_v1 response;
 	int receive_result;
-	bool finished = false;
-	bool handled_message = false;
 
-	while (!finished && !ahe_broker_stopping) {
-		receive_result = ahe_broker_receive_message(client_fd, &request);
-		if (receive_result <= 0) {
-			break;
-		}
-		handled_message = true;
-
-		switch (request.type) {
-			case AHE_BROKER_ACQUIRE:
-				if (ahe_broker_handle_acquire(client_fd, generation, &request) < 0) {
-					finished = true;
-				}
-				break;
-			case AHE_BROKER_READY:
-				if (ahe_broker_handle_ready(client_fd, generation, &request) < 0) {
-					finished = true;
-				}
-				break;
-			case AHE_BROKER_ABORT:
-				if (generation->state == AHE_GENERATION_INITIALIZING
-				 && generation->creator_fd == client_fd) {
-					ahe_generation_reset(generation);
-				}
-				ahe_broker_message_init(&response, AHE_BROKER_ACK);
-				if (ahe_broker_send_message(client_fd, &response, NULL, 0) < 0) {
-					finished = true;
-				}
-				break;
-			case AHE_BROKER_DETACH:
-				ahe_broker_message_init(&response, AHE_BROKER_ACK);
-				(void) ahe_broker_send_message(client_fd, &response, NULL, 0);
-				finished = true;
-				break;
-			default:
-				ahe_broker_message_init(&response, AHE_BROKER_ERROR);
-				(void) ahe_broker_send_message(client_fd, &response, NULL, 0);
-				finished = true;
-				break;
-		}
+	receive_result = ahe_broker_receive_message(client->fd, &request);
+	if (receive_result <= 0) {
+		return false;
 	}
+	client->handled_message = true;
+
+	switch (request.type) {
+		case AHE_BROKER_ACQUIRE:
+			return ahe_broker_handle_acquire(client->fd, generation, &request) == 0;
+		case AHE_BROKER_READY:
+			return ahe_broker_handle_ready(client->fd, generation, &request) == 0;
+		case AHE_BROKER_ABORT:
+			if (generation->state == AHE_GENERATION_INITIALIZING
+			 && generation->creator_fd == client->fd) {
+				ahe_generation_reset(generation);
+			}
+			ahe_broker_message_init(&response, AHE_BROKER_ACK);
+			return ahe_broker_send_message(client->fd, &response, NULL, 0) == 0;
+		case AHE_BROKER_DETACH:
+			ahe_broker_message_init(&response, AHE_BROKER_ACK);
+			(void) ahe_broker_send_message(client->fd, &response, NULL, 0);
+			return false;
+		default:
+			ahe_broker_message_init(&response, AHE_BROKER_ERROR);
+			(void) ahe_broker_send_message(client->fd, &response, NULL, 0);
+			return false;
+	}
+}
+
+static void ahe_broker_close_client(
+	ahe_broker_client_connection *clients,
+	size_t *client_count,
+	size_t client_index,
+	ahe_generation *generation
+)
+{
+	int client_fd = clients[client_index].fd;
 
 	if (generation->state == AHE_GENERATION_INITIALIZING
 	 && generation->creator_fd == client_fd) {
 		ahe_generation_reset(generation);
 	}
+	close(client_fd);
+	clients[client_index] = clients[*client_count - 1];
+	(*client_count)--;
+}
 
-	return handled_message;
+static int ahe_broker_add_client(
+	ahe_broker_client_connection **clients,
+	size_t *client_count,
+	size_t *client_capacity,
+	int client_fd
+)
+{
+	ahe_broker_client_connection *resized_clients;
+	size_t new_capacity;
+
+	if (*client_count == *client_capacity) {
+		if (*client_capacity > SIZE_MAX / 2) {
+			errno = ENOMEM;
+			return -1;
+		}
+		new_capacity = *client_capacity ? *client_capacity * 2 : 8;
+		if (new_capacity > SIZE_MAX / sizeof(**clients)) {
+			errno = ENOMEM;
+			return -1;
+		}
+		resized_clients = realloc(*clients, new_capacity * sizeof(**clients));
+		if (!resized_clients) {
+			return -1;
+		}
+		*clients = resized_clients;
+		*client_capacity = new_capacity;
+	}
+
+	(*clients)[*client_count].fd = client_fd;
+	(*clients)[*client_count].handled_message = false;
+	(*client_count)++;
+	return 0;
 }
 
 static int ahe_broker_prepare_parent_directory(const char *socket_path)
@@ -430,7 +473,11 @@ static int ahe_broker_create_listener(const char *socket_path)
 		return -1;
 	}
 
-	listener_fd = socket(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0);
+	listener_fd = socket(
+		AF_UNIX,
+		SOCK_SEQPACKET | SOCK_CLOEXEC | SOCK_NONBLOCK,
+		0
+	);
 	if (listener_fd < 0) {
 		return -1;
 	}
@@ -483,9 +530,14 @@ int main(int argc, char **argv)
 	const char *socket_path = NULL;
 	unsigned long max_clients = 0;
 	unsigned long handled_clients = 0;
+	ahe_broker_client_connection *clients = NULL;
 	ahe_generation generation;
+	struct pollfd *poll_fds = NULL;
 	struct sigaction action;
-	int listener_fd;
+	size_t client_capacity = 0;
+	size_t client_count = 0;
+	size_t poll_capacity = 0;
+	int listener_fd = -1;
 	int client_fd;
 	int i;
 	int exit_status = EXIT_SUCCESS;
@@ -523,13 +575,134 @@ int main(int argc, char **argv)
 		return EXIT_FAILURE;
 	}
 
-	while (!ahe_broker_stopping && (!max_clients || handled_clients < max_clients)) {
-		struct ucred credentials;
-		socklen_t credentials_size = sizeof(credentials);
+	while (!ahe_broker_stopping) {
+		size_t client_index;
+		size_t poll_fd_count;
+		struct pollfd *resized_poll_fds;
+		int poll_result;
 
-		client_fd = accept4(listener_fd, NULL, NULL, SOCK_CLOEXEC);
-		if (client_fd < 0) {
+		if (max_clients && handled_clients >= max_clients) {
+			if (listener_fd >= 0) {
+				close(listener_fd);
+				listener_fd = -1;
+			}
+			for (client_index = client_count; client_index > 0; client_index--) {
+				size_t index = client_index - 1;
+
+				if (!clients[index].handled_message) {
+					ahe_broker_close_client(
+						clients,
+						&client_count,
+						index,
+						&generation
+					);
+				}
+			}
+			if (!client_count) {
+				break;
+			}
+		}
+
+		if (client_count == SIZE_MAX) {
+			errno = ENOMEM;
+			perror("ahe-broker: poll allocation");
+			exit_status = EXIT_FAILURE;
+			break;
+		}
+		poll_fd_count = client_count + 1;
+		if (poll_fd_count > poll_capacity) {
+			if (poll_fd_count > SIZE_MAX / sizeof(*poll_fds)) {
+				errno = ENOMEM;
+				perror("ahe-broker: poll allocation");
+				exit_status = EXIT_FAILURE;
+				break;
+			}
+			resized_poll_fds = realloc(
+				poll_fds,
+				poll_fd_count * sizeof(*poll_fds)
+			);
+			if (!resized_poll_fds) {
+				perror("ahe-broker: poll allocation");
+				exit_status = EXIT_FAILURE;
+				break;
+			}
+			poll_fds = resized_poll_fds;
+			poll_capacity = poll_fd_count;
+		}
+
+		poll_fds[0].fd = listener_fd;
+		poll_fds[0].events = POLLIN;
+		poll_fds[0].revents = 0;
+		for (client_index = 0; client_index < client_count; client_index++) {
+			poll_fds[client_index + 1].fd = clients[client_index].fd;
+			poll_fds[client_index + 1].events = POLLIN;
+			poll_fds[client_index + 1].revents = 0;
+		}
+
+		poll_result = poll(poll_fds, (nfds_t) poll_fd_count, -1);
+		if (poll_result < 0) {
 			if (errno == EINTR) {
+				continue;
+			}
+			perror("ahe-broker: poll");
+			exit_status = EXIT_FAILURE;
+			break;
+		}
+
+		for (client_index = client_count; client_index > 0; client_index--) {
+			size_t index = client_index - 1;
+			short events = poll_fds[index + 1].revents;
+			bool handled_before;
+			bool keep_open = true;
+
+			if (!events) {
+				continue;
+			}
+			handled_before = clients[index].handled_message;
+			if (max_clients && handled_clients >= max_clients
+			 && !handled_before) {
+				keep_open = false;
+			} else if (events & POLLIN) {
+				keep_open = ahe_broker_handle_client_message(
+					&clients[index],
+					&generation
+				);
+				if (!handled_before && clients[index].handled_message
+				 && handled_clients < ULONG_MAX) {
+					handled_clients++;
+				}
+			}
+			if (events & (POLLERR | POLLHUP | POLLNVAL)) {
+				keep_open = false;
+			}
+			if (!keep_open) {
+				ahe_broker_close_client(
+					clients,
+					&client_count,
+					index,
+					&generation
+				);
+			}
+		}
+
+		if ((max_clients && handled_clients >= max_clients)
+		 || !(poll_fds[0].revents & POLLIN)) {
+			if (poll_fds[0].revents & (POLLERR | POLLHUP | POLLNVAL)) {
+				fprintf(stderr, "ahe-broker: listener poll failure\n");
+				exit_status = EXIT_FAILURE;
+				break;
+			}
+			continue;
+		}
+
+		client_fd = accept4(
+			listener_fd,
+			NULL,
+			NULL,
+			SOCK_CLOEXEC | SOCK_NONBLOCK
+		);
+		if (client_fd < 0) {
+			if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) {
 				continue;
 			}
 			perror("ahe-broker: accept");
@@ -537,28 +710,52 @@ int main(int argc, char **argv)
 			break;
 		}
 
-		if (getsockopt(
-			client_fd,
-			SOL_SOCKET,
-			SO_PEERCRED,
-			&credentials,
-			&credentials_size
-		) < 0
-		 || credentials_size != sizeof(credentials)
-		 || credentials.pid <= 0
-		 || credentials.uid != geteuid()) {
-			close(client_fd);
-			continue;
+		{
+			struct ucred credentials;
+			socklen_t credentials_size = sizeof(credentials);
+
+			if (getsockopt(
+				client_fd,
+				SOL_SOCKET,
+				SO_PEERCRED,
+				&credentials,
+				&credentials_size
+			) < 0
+			 || credentials_size != sizeof(credentials)
+			 || credentials.pid <= 0
+			 || credentials.uid != geteuid()) {
+				close(client_fd);
+				continue;
+			}
 		}
 
-		if (ahe_broker_handle_client(client_fd, &generation)) {
-			handled_clients++;
+		if (ahe_broker_add_client(
+			&clients,
+			&client_count,
+			&client_capacity,
+			client_fd
+		) < 0) {
+			perror("ahe-broker: client allocation");
+			close(client_fd);
+			exit_status = EXIT_FAILURE;
+			break;
 		}
-		close(client_fd);
 	}
 
+	while (client_count) {
+		ahe_broker_close_client(
+			clients,
+			&client_count,
+			client_count - 1,
+			&generation
+		);
+	}
+	free(clients);
+	free(poll_fds);
 	ahe_generation_reset(&generation);
-	close(listener_fd);
+	if (listener_fd >= 0) {
+		close(listener_fd);
+	}
 	if (unlink(socket_path) < 0 && errno != ENOENT) {
 		perror("ahe-broker: unlink");
 		exit_status = EXIT_FAILURE;

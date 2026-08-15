@@ -15,7 +15,7 @@ The project currently provides a Linux/PHP 8.4 reattachment prototype:
 - `ahe-php` disables ASLR before executing the packaged PHP interpreter; and
 - Nix checks prove that one CLI process can populate OPcache and a later independent process can attach and hit the same cached script.
 
-The broker currently retains one cache generation and handles clients serially. A client that encounters a busy broker waits for at most one second before falling back to process-local OPcache. The broker must be started explicitly; automatic discovery, concurrent shared-cache access, generation retirement, and complete extension fingerprinting remain future work. See [the architecture notes](docs/architecture.md).
+The broker currently retains one cache generation and multiplexes concurrent clients over a shared cache and lock object. OPcache's existing inter-process locks coordinate cache writes and restarts. The broker must be started explicitly; automatic discovery, generation retirement, and complete extension fingerprinting remain future work. See [the architecture notes](docs/architecture.md).
 
 ## Build with Nix
 
@@ -31,7 +31,7 @@ Run the packaged PHP interpreter with the extension enabled:
 nix run . -- -v
 ```
 
-`nix run` uses the `ahe-php` launcher. It disables ASLR for the PHP process and enables CLI OPcache with JIT disabled. This is an intentional, opt-in security tradeoff for controlled PHPStan and CI workloads; do not use the launcher to execute untrusted PHP code.
+`nix run` uses the `ahe-php` launcher. It disables ASLR for the PHP process and enables CLI OPcache with JIT and forced locker termination disabled. This is an intentional, opt-in security tradeoff for controlled PHPStan and CI workloads; do not use the launcher to execute untrusted PHP code.
 
 Build or invoke the packages individually:
 
@@ -60,11 +60,16 @@ In another shell, run multiple PHP commands with the same socket and namespace:
 ```console
 export AHE_BROKER_SOCKET="$XDG_RUNTIME_DIR/abyssal-hyperglyph-engine/broker.sock"
 export AHE_CACHE_NAMESPACE="my-project"
+export PHPSTAN_TURBO=0
 nix run . -- vendor/bin/phpstan analyse
 nix run . -- vendor/bin/phpstan analyse
 ```
 
-The effective user, namespace, SAPI, finalized Zend system ID, active `opcache.*` configuration, engine entry-point address, and requested allocation size form the current cache key. A mismatched key, busy broker, unauthenticated socket, or unavailable fixed address falls back to ordinary process-local OPcache.
+PHPStan starts parallel workers with the same `PHP_BINARY`, environment, and loaded `php.ini`, so they retain AHE's broker configuration and ASLR-disabled personality. PHPStan 2.2 PHARs additionally load their bundled Turbo extension in workers only; `PHPSTAN_TURBO=0` is currently required so the parent and workers have the same extension layout. Put any custom `opcache.*` settings in the shared ini rather than passing them with `-d` to the parent, because PHPStan does not propagate arbitrary CLI ini overrides to its workers.
+
+The effective user, namespace, SAPI, finalized Zend system ID, active `opcache.*` configuration, engine entry-point address, and requested allocation size form the current cache key. A mismatched key, unauthenticated socket, unavailable broker, or unavailable fixed address falls back to ordinary process-local OPcache.
+
+AHE persistence requires `opcache.force_restart_timeout=0`. Stock OPcache may otherwise kill processes that retain its request lock after a forced-restart deadline, which is suitable for replaceable FPM workers but not a PHPStan parent and its sibling CLI workers. With the timeout disabled, a pending restart waits until every active participant releases the shared request lock.
 
 Run all build, smoke, and repository checks:
 

@@ -207,6 +207,14 @@ static int ahe_create_segments(
 	if (!cache_namespace || !cache_namespace[0]) {
 		cache_namespace = "default";
 	}
+	if (zend_ini_long(
+		"opcache.force_restart_timeout",
+		sizeof("opcache.force_restart_timeout") - 1,
+		false
+	) != 0) {
+		*error_in = "AHE requires opcache.force_restart_timeout=0 to avoid killing attached CLI processes";
+		return ZEND_OPCACHE_SHM_ALLOC_FAILURE;
+	}
 	if (ahe_opcache_configuration_digest(configuration_digest) != SUCCESS) {
 		*error_in = "AHE could not fingerprint the OPcache configuration";
 		return ZEND_OPCACHE_SHM_ALLOC_FAILURE;
@@ -244,7 +252,7 @@ static int ahe_create_segments(
 	if (result == ZEND_OPCACHE_SHM_ALLOC_FAILURE && broker->timed_out) {
 		zend_error(
 			E_CORE_WARNING,
-			"%s: the broker is busy; using process-local OPcache for this invocation",
+			"%s: the broker did not respond; using process-local OPcache for this invocation",
 			AHE_NAME
 		);
 	}
