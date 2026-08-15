@@ -62,4 +62,15 @@ zend_extension=opcache.so
 
 ## License
 
-AGPL-3.0-or-later, following the licensing already established by the initial project scaffold.
+Abyssal Hyperglyph Engine is licensed under the **GNU Affero General Public License version 3 with the Romic
+Exception**:
+
+```text
+AGPL-3.0-only WITH romic-exception
+```
+
+The Romic Exception permits AHE to be linked or combined with other code without subjecting that other code to the AGPL
+merely because of the linking or combination. Modifications to AHE itself remain subject to the AGPL, including its
+source-availability requirements for modified versions made available over a computer network.
+
+See [LICENSE.md](LICENSE.md) and [docs/LICENSE_EXCEPTION.md](docs/LICENSE_EXCEPTION.md) for the complete terms.

@@ -35,8 +35,10 @@
             ./.github/dependabot.yml
             ./.github/workflows/ci.yml
             ./.gitignore
+            ./LICENSE.md
             ./README.md
             ./config.m4
+            ./docs/LICENSE_EXCEPTION.md
             ./docs/architecture.md
             ./flake.lock
             ./flake.nix
@@ -51,6 +53,8 @@
           root = ./.;
           fileset = lib.fileset.unions [
             ./config.m4
+            ./docs/LICENSE_EXCEPTION.md
+            ./LICENSE.md
             ./scripts/smoke-test.sh
             ./src/abyssal_hyperglyph_engine.c
             ./src/abyssal_hyperglyph_engine.h
@@ -68,7 +72,14 @@
 
           meta = {
             description = "Experimental Zend extension infrastructure for persistent CLI OPcache";
-            license = lib.licenses.agpl3Plus;
+            license =
+              lib.licenses.agpl3Only
+              // {
+                fullName = "GNU Affero General Public License v3.0 only with the Romic Exception";
+                shortName = "agpl3OnlyWithRomicException";
+                spdxId = "AGPL-3.0-only WITH romic-exception";
+                url = "https://spdx.org/licenses/romic-exception.html";
+              };
             platforms = lib.platforms.linux;
           };
         };
@@ -97,6 +108,7 @@
             alejandra.enable = true;
             markdownlint = {
               enable = true;
+              excludes = ["LICENSE\\.md"];
               settings.configuration.MD013 = {
                 line_length = 1488;
                 table = false;
