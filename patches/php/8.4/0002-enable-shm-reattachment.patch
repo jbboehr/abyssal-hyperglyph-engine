@@ -1,0 +1,39 @@
+diff --git a/Zend/zend_portability.h b/Zend/zend_portability.h
+index e717ade957..78afed3951 100644
+--- a/Zend/zend_portability.h
++++ b/Zend/zend_portability.h
+@@ -868,6 +868,7 @@ static zend_always_inline uint64_t _byteswap_uint64(uint64_t u) {
+-#ifdef ZEND_WIN32
++#if defined(ZEND_WIN32) || defined(__linux__)
+ /* Whether it's allowed to reattach to a shm segment from different processes on
+  * this platform. This prevents pointing to internal structures from shm due to
+- * ASLR. Currently only possible on Windows. */
++ * ASLR. The AHE Linux build provides the same address-stability contract by
++ * disabling ASLR before PHP starts. */
+ # define ZEND_OPCACHE_SHM_REATTACHMENT 1
+ #endif
+diff --git a/ext/opcache/ZendAccelerator.c b/ext/opcache/ZendAccelerator.c
+index 988c04a130..a6f1eb99e0 100644
+--- a/ext/opcache/ZendAccelerator.c
++++ b/ext/opcache/ZendAccelerator.c
+@@ -1825,5 +1825,5 @@ static zend_persistent_script *opcache_compile_file(zend_file_handle *file_handle, int type, zend_op_array **op_array_p)
+-#ifdef ZEND_WIN32
+-		/* On Windows, don't compile with internal classes. Shm may be attached from different
++#ifdef ZEND_OPCACHE_SHM_REATTACHMENT
++		/* Don't compile with internal classes. Shm may be attached from different
+ 		 * processes with internal classes living in different addresses. */
+ 		CG(compiler_options) |= ZEND_COMPILE_IGNORE_INTERNAL_CLASSES;
+ #endif
+diff --git a/ext/opcache/tests/dump_property_hooks.phpt b/ext/opcache/tests/dump_property_hooks.phpt
+index b0c410f4dc..ba0d4cd3ae 100644
+--- a/ext/opcache/tests/dump_property_hooks.phpt
++++ b/ext/opcache/tests/dump_property_hooks.phpt
+@@ -9,6 +9,4 @@ opcache
+ --SKIPIF--
+ <?php
+-if (PHP_OS_FAMILY === 'Windows') {
+-    die('skip Windows emits additional DECLARE_CLASS_DELAYED opcode');
+-}
++die('skip SHM reattachment emits an additional DECLARE_CLASS_DELAYED opcode');
+ ?>
+ --FILE--

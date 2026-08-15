@@ -2,6 +2,10 @@
 
 declare(strict_types=1);
 
+if (getenv('AHE_BENCHMARK_EXPECT_ATTACHMENT') !== '1') {
+    return;
+}
+
 $maps = file_get_contents('/proc/self/maps');
 $status = opcache_get_status(false);
 if ($maps === false || !str_contains($maps, '/memfd:ahe-opcache') || $status === false) {

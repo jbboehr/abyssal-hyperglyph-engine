@@ -25,6 +25,7 @@ in {
       ./packages.nix
       ./sources.nix
       ../patches/php/8.4/0001-external-shared-memory-provider.patch
+      ../patches/php/8.4/0002-enable-shm-reattachment.patch
       ../scripts/benchmark-phpstan.sh
       ../scripts/reproduce-class-linking.sh
       ../scripts/smoke-test.sh

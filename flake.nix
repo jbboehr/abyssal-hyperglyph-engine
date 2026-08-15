@@ -33,6 +33,7 @@
         inherit
           (ahePackages)
           extension
+          phpForAhe
           phpWithAhe
           aheLauncher
           aheBroker
@@ -84,7 +85,7 @@
             aheLauncher
             phpWithAhe
             php.packages.composer
-            php.unwrapped.dev
+            phpForAhe.unwrapped.dev
             time
             valgrind
           ];
@@ -93,7 +94,7 @@
             ${aheChecks.preCommitCheck.shellHook}
             export NO_INTERACTION=1
             export REPORT_EXIT_STATUS=1
-            export TEST_PHP_EXECUTABLE=${php.unwrapped}/bin/php
+            export TEST_PHP_EXECUTABLE=${phpForAhe.unwrapped}/bin/php
           '';
         };
 

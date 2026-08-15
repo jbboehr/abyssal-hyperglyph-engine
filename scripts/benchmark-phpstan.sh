@@ -154,7 +154,7 @@ declare -a analysis_command
 build_analysis_command() {
   local mode=$1
   local attachment_directory=${2:-}
-  local -a mode_arguments=()
+  local -a mode_arguments=("--autoload-file=$attachment_probe")
   analysis_command=(env -C "$checkout_directory")
 
   case $mode in
@@ -162,6 +162,7 @@ build_analysis_command() {
       analysis_command+=(
         -u AHE_BROKER_SOCKET
         -u AHE_CACHE_NAMESPACE
+        AHE_BENCHMARK_EXPECT_ATTACHMENT=0
       )
       ;;
     ahe)
@@ -174,8 +175,8 @@ build_analysis_command() {
         "AHE_BROKER_SOCKET=$broker_socket"
         "AHE_CACHE_NAMESPACE=phpunit-$phpunit_commit"
         "AHE_BENCHMARK_ATTACHMENT_DIRECTORY=$attachment_directory"
+        AHE_BENCHMARK_EXPECT_ATTACHMENT=1
       )
-      mode_arguments+=("--autoload-file=$attachment_probe")
       ;;
     *)
       printf 'Unknown benchmark mode: %s\n' "$mode" >&2
@@ -377,9 +378,9 @@ if ! run_analysis ahe "$prime_attachment_directory" >"$result_directory/ahe-prim
 The retained-generation PHPStan prime failed; see:
   $result_directory/ahe-prime.log
 
-The current prototype cannot yet safely reuse PHPStan's full persisted class-linking
-state across independently executed parent and worker processes. No timing samples
-were recorded, so this failure cannot be mistaken for a benchmark result.
+The retained-generation PHPStan regression failed across independently executed
+parent and worker processes. No timing samples were recorded, so this failure
+cannot be mistaken for a benchmark result.
 EOF
   exit 1
 fi

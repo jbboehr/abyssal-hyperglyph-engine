@@ -5,8 +5,13 @@
   sources,
 }: let
   opcacheProviderPatch = ../patches/php/8.4/0001-external-shared-memory-provider.patch;
+  shmReattachmentPatch = ../patches/php/8.4/0002-enable-shm-reattachment.patch;
 
-  extensionBase = php.buildPecl {
+  phpForAhe = php.overrideAttrs (old: {
+    patches = (old.patches or []) ++ [shmReattachmentPatch];
+  });
+
+  extensionBase = phpForAhe.buildPecl {
     pname = "abyssal_hyperglyph_engine";
     version = "0.1.0-dev";
     src = sources.extension;
@@ -34,16 +39,16 @@
       runHook preCheck
 
       extension_path="$PWD/modules/abyssal_hyperglyph_engine.so"
-      TEST_PHP_EXECUTABLE=${php.unwrapped}/bin/php \
+      TEST_PHP_EXECUTABLE=${phpForAhe.unwrapped}/bin/php \
         bash scripts/smoke-test.sh "$extension_path"
-      ${php.unwrapped}/bin/php -n run-tests.php \
+      ${phpForAhe.unwrapped}/bin/php -n run-tests.php \
         -q -n -d "zend_extension=$extension_path" tests
 
       runHook postCheck
     '';
   });
 
-  phpWithAhe = php.buildEnv {
+  phpWithAhe = phpForAhe.buildEnv {
     extensions = {enabled, ...}: let
       patchedEnabled =
         map (
@@ -51,7 +56,12 @@
             if candidate.extensionName == "opcache"
             then
               candidate.overrideAttrs (old: {
-                patches = (old.patches or []) ++ [opcacheProviderPatch];
+                patches =
+                  (old.patches or [])
+                  ++ [
+                    opcacheProviderPatch
+                    shmReattachmentPatch
+                  ];
               })
             else candidate
         )
@@ -135,5 +145,5 @@
       };
   };
 in {
-  inherit extension phpWithAhe aheLauncher aheBroker;
+  inherit extension phpForAhe phpWithAhe aheLauncher aheBroker;
 }

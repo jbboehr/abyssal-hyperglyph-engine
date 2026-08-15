@@ -13,14 +13,12 @@ nix develop
 scripts/benchmark-phpstan.sh --samples 5
 ```
 
-At present this is also a real-world regression reproducer. The process-local
-prime succeeds, but the retained-generation prime stops before timing because
-independently executed PHPStan workers can fault while binding classes restored
-from shared OPcache. The script emits no benchmark summary unless the prime and
-its attachment probe both succeed, so this known failure cannot be reported as
-a speedup. See the architecture document for the current diagnosis.
-The smaller `scripts/reproduce-class-linking.sh` case exercises the same class
-of failure using one cached class that extends an internal PHP class.
+This also provides real-world regression coverage for cross-process class
+linking. The retained-generation prime and every timed AHE sample must prove
+that the PHPStan parent and workers attached successfully before the harness
+records a result. The smaller `scripts/reproduce-class-linking.sh` case covers
+the original reduction using one cached class that extends an internal PHP
+class.
 
 The checkout, installed Composer dependencies, logs, metadata, raw TSV samples,
 and summary stay under the benchmark cache directory printed by the script.
@@ -42,11 +40,13 @@ alternates ordinary process-local OPcache and AHE samples to reduce ordering
 bias. The AHE generation is primed with a complete, result-cache-cold analysis
 before timing starts.
 
-Every AHE parent and worker loads an attachment assertion through PHPStan's
-`--autoload-file` option. A process that cannot find the AHE `memfd` mapping
-exits immediately, and each timed AHE sample must produce a fresh parent marker
-before it can be recorded. This prevents process-local fallback from being
-reported as an AHE result.
+Both modes load the same file through PHPStan's `--autoload-file` option so the
+result-cache configuration is identical. In AHE mode it asserts attachment in
+every parent and worker; in baseline mode it is a no-op. A process that cannot
+find the AHE `memfd` mapping exits immediately, and each timed AHE sample must
+produce a fresh parent marker before it can be recorded. This prevents both
+result-cache invalidation and process-local fallback from distorting the
+comparison.
 
 PHPStan runs its engine from a PHAR. With PHP 8.4's normal OPcache settings,
 timestamp and file-update checks cannot obtain a timestamp for internal PHAR

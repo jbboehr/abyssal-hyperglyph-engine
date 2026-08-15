@@ -83,9 +83,9 @@ attacher_status=$?
 set -e
 
 if [[ "$attacher_status" -eq 0 ]]; then
-  echo "The class-linking regression no longer reproduces."
+  echo "The persisted internal-parent class passed the attachment check."
 else
-  printf 'The retained class-linking regression reproduced with status %s.\n' \
+  printf 'The attacher could not instantiate the persisted internal-parent class (status %s).\n' \
     "$attacher_status" >&2
 fi
 exit "$attacher_status"

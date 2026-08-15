@@ -9,6 +9,7 @@ The repository slug is `abyssal-hyperglyph-engine`. The extension binary and bui
 The project currently provides a Linux/PHP 8.4 reattachment prototype:
 
 - a PHP 8.4 patch exposes the version-two external shared-memory provider ABI;
+- the packaged PHP build enables PHP's shared-memory reattachment safeguards and prevents OPcache from compiling against process-local internal classes;
 - AHE discovers OPcache during Zend extension loading and registers before OPcache startup;
 - the ABI covers allocation, detachment, a shared lock descriptor, locking, startup completion or failure, and shutdown;
 - `ahe-broker` retains cache and lock `memfd` descriptors and transfers them over a mutually authenticated, private Unix socket;
@@ -87,20 +88,19 @@ scripts/benchmark-phpstan.sh --samples 5
 The benchmark reports AHE and process-local OPcache separately with PHPStan's
 result cache cold and warm. See
 [`benchmarks/phpstan/README.md`](benchmarks/phpstan/README.md) for the cache
-controls, the immutable-PHAR OPcache profile, and the real-project class-linking
-regression that currently prevents timing from starting.
+controls, the immutable-PHAR OPcache profile, and the attachment assertions
+required before a sample is recorded.
 
-Reproduce the underlying class-linking fault without PHPStan:
+Run the reduced class-linking regression test without PHPStan:
 
 ```console
 nix develop
 scripts/reproduce-class-linking.sh
 ```
 
-The attacher currently exits from a segmentation fault. The script uses a fixed
-private path because the stale metadata is layout-sensitive; see the
-architecture notes for the one-class reduction and the relevant PHP core
-reattachment safeguard.
+The script proves that a fresh process can instantiate a persisted user class
+that extends an internal class. It uses the fixed private path that exposed the
+original layout-sensitive fault; the same scenario is also a Nix flake check.
 
 Enter the development environment:
 
@@ -125,7 +125,9 @@ php -n \
   -v
 ```
 
-To load AHE with OPcache, apply the matching patch from `patches/php/<minor>/` when building OPcache and place AHE before it:
+The standalone steps above build only AHE and are sufficient for load diagnostics. Persistent OPcache additionally requires a matching patched PHP interpreter. Apply both patches from `patches/php/<minor>/` to the complete PHP source tree, build PHP core and OPcache from that tree, and then build AHE with that installation's `phpize` and `php-config`. Applying `0002` only while building `opcache.so` is insufficient because its reattachment safeguards are also compiled into the Zend engine.
+
+Place AHE before the resulting OPcache extension:
 
 ```ini
 zend_extension=/absolute/path/to/abyssal_hyperglyph_engine.so
@@ -136,11 +138,14 @@ AHE fails its Zend startup when it sees an unpatched OPcache or cannot register 
 
 ## PHP version patches
 
-OPcache is built from upstream PHP source plus a small patch series rather than vendored source copies. PHP 8.4 is the only supported series during the initial feasibility work:
+PHP core and OPcache are built from upstream PHP source plus a small patch series rather than vendored source copies. PHP 8.4 is the only supported series during the initial feasibility work:
 
 ```text
 patches/php/8.4/0001-external-shared-memory-provider.patch
+patches/php/8.4/0002-enable-shm-reattachment.patch
 ```
+
+`0001` adds the external shared-memory provider ABI to OPcache. `0002` enables the corresponding Zend-engine class-linking safeguards and makes OPcache avoid compile-time links to process-local internal classes; it must be present in both PHP core and the OPcache build.
 
 Additional minor versions should be added only after the broker-backed two-process test succeeds on PHP 8.4.
 

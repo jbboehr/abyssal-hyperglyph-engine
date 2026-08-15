@@ -327,6 +327,17 @@
     touch "$out"
   '';
 
+  classLinkingSmoke =
+    pkgs.runCommand "abyssal-hyperglyph-engine-class-linking-smoke" {
+      nativeBuildInputs = [
+        aheBroker
+        aheLauncher
+      ];
+    } ''
+      bash ${repositorySource}/scripts/reproduce-class-linking.sh
+      touch "$out"
+    '';
+
   phpstanParallelSmoke = pkgs.runCommand "abyssal-hyperglyph-engine-phpstan-parallel-smoke" {} ''
     broker_socket="$TMPDIR/ahe-broker.sock"
     marker_directory="$TMPDIR/phpstan-markers"
@@ -605,6 +616,7 @@ in {
     inherit extension;
     broker-lifecycle-smoke = brokerLifecycleSmoke;
     broker-multiplex-smoke = brokerMultiplexSmoke;
+    class-linking-smoke = classLinkingSmoke;
     launcher-smoke = launcherSmoke;
     persistence-smoke = persistenceSmoke;
     phpstan-parallel-smoke = phpstanParallelSmoke;
