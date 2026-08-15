@@ -6,7 +6,7 @@ PHP_ARG_ENABLE([abyssal-hyperglyph-engine],
 
 AS_VAR_IF([PHP_ABYSSAL_HYPERGLYPH_ENGINE], [no],, [
   PHP_NEW_EXTENSION([abyssal_hyperglyph_engine],
-    [src/abyssal_hyperglyph_engine.c],
+    [src/abyssal_hyperglyph_engine.c src/ahe_broker_client.c],
     [$ext_shared],,
     [-DZEND_ENABLE_STATIC_TSRMLS_CACHE=1])
 ])

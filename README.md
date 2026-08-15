@@ -6,15 +6,16 @@ The repository slug is `abyssal-hyperglyph-engine`. The extension binary and bui
 
 ## Status
 
-The project currently provides the first OPcache integration milestone:
+The project currently provides a Linux/PHP 8.4 reattachment prototype:
 
-- a PHP 8.4 patch exposes a versioned external shared-memory provider ABI;
+- a PHP 8.4 patch exposes the version-two external shared-memory provider ABI;
 - AHE discovers OPcache during Zend extension loading and registers before OPcache startup;
-- the ABI covers allocation, detachment, locking, startup completion or failure, and shutdown;
+- the ABI covers allocation, detachment, a shared lock descriptor, locking, startup completion or failure, and shutdown;
+- `ahe-broker` retains cache and lock `memfd` descriptors and transfers them over a mutually authenticated, private Unix socket;
 - `ahe-php` disables ASLR before executing the packaged PHP interpreter; and
-- Nix checks prove that patched OPcache initializes normally when the unfinished AHE provider declines allocation.
+- Nix checks prove that one CLI process can populate OPcache and a later independent process can attach and hit the same cached script.
 
-The provider does not persist memory yet. It deliberately falls back to OPcache's stock allocator until the broker backend is implemented. See [the architecture notes](docs/architecture.md).
+The broker currently retains one cache generation and handles clients serially. A client that encounters a busy broker waits for at most one second before falling back to process-local OPcache. The broker must be started explicitly; automatic discovery, concurrent shared-cache access, generation retirement, and complete extension fingerprinting remain future work. See [the architecture notes](docs/architecture.md).
 
 ## Build with Nix
 
@@ -36,11 +37,34 @@ Build or invoke the packages individually:
 
 ```console
 nix build .#ahe-php
+nix build .#ahe-broker
 nix run .#ahe-php -- -i
 nix build .#php
 ```
 
 The `php` package contains AHE and patched OPcache but does not itself disable ASLR. Use `ahe-php` for the stable-address contract.
+
+## Try persistent CLI OPcache
+
+Start the broker beneath your private runtime directory:
+
+```console
+export AHE_BROKER_SOCKET="$XDG_RUNTIME_DIR/abyssal-hyperglyph-engine/broker.sock"
+nix run .#broker -- --socket "$AHE_BROKER_SOCKET"
+```
+
+The broker creates the final parent directory with mode `0700` when needed and refuses directories that are not owned by the effective user or are writable by group or others. It also refuses non-socket and foreign-owned stale paths.
+
+In another shell, run multiple PHP commands with the same socket and namespace:
+
+```console
+export AHE_BROKER_SOCKET="$XDG_RUNTIME_DIR/abyssal-hyperglyph-engine/broker.sock"
+export AHE_CACHE_NAMESPACE="my-project"
+nix run . -- vendor/bin/phpstan analyse
+nix run . -- vendor/bin/phpstan analyse
+```
+
+The effective user, namespace, SAPI, finalized Zend system ID, active `opcache.*` configuration, engine entry-point address, and requested allocation size form the current cache key. A mismatched key, busy broker, unauthenticated socket, or unavailable fixed address falls back to ordinary process-local OPcache.
 
 Run all build, smoke, and repository checks:
 
@@ -78,7 +102,7 @@ zend_extension=/absolute/path/to/abyssal_hyperglyph_engine.so
 zend_extension=opcache.so
 ```
 
-AHE fails its Zend startup when it sees an unpatched OPcache or cannot register the provider. Loading AHE without OPcache remains supported for build and diagnostic checks.
+AHE fails its Zend startup when it sees an unpatched OPcache or cannot register the version-two provider. A mismatched older provider ABI is therefore rejected rather than interpreted as a different callback layout. Loading AHE without OPcache remains supported for build and diagnostic checks.
 
 ## PHP version patches
 

@@ -57,6 +57,8 @@ test.php
 tests/**/*.diff
 tests/**/*.exp
 tests/**/*.php
+!tests/fixtures/*.php
+!tests/integration/*.php
 tests/**/*.sh
 third-party
 tmp-php.ini

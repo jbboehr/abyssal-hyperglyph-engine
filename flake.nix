@@ -33,6 +33,7 @@
           fileset = lib.fileset.unions [
             ./.editorconfig
             ./.envrc
+            ./.gitattributes
             ./.github/dependabot.yml
             ./.github/workflows/ci.yml
             ./.gitignore
@@ -45,11 +46,18 @@
             ./flake.nix
             ./patches/php/8.4/0001-external-shared-memory-provider.patch
             ./scripts/smoke-test.sh
+            ./src/ahe_broker.c
+            ./src/ahe_broker_client.c
+            ./src/ahe_broker_client.h
+            ./src/ahe_broker_protocol.h
             ./src/ahe_opcache_provider.h
             ./src/ahe_php.c
             ./src/abyssal_hyperglyph_engine.c
             ./src/abyssal_hyperglyph_engine.h
             ./tests/001-load.phpt
+            ./tests/fixtures/persistent.php
+            ./tests/integration/cache-attach.php
+            ./tests/integration/cache-create.php
           ];
         };
 
@@ -60,6 +68,9 @@
             ./docs/LICENSE_EXCEPTION.md
             ./LICENSE.md
             ./scripts/smoke-test.sh
+            ./src/ahe_broker_client.c
+            ./src/ahe_broker_client.h
+            ./src/ahe_broker_protocol.h
             ./src/ahe_opcache_provider.h
             ./src/abyssal_hyperglyph_engine.c
             ./src/abyssal_hyperglyph_engine.h
@@ -161,6 +172,40 @@
             };
         };
 
+        aheBroker = pkgs.stdenv.mkDerivation {
+          pname = "ahe-broker";
+          version = "0.1.0-dev";
+          dontUnpack = true;
+          strictDeps = true;
+
+          buildPhase = ''
+            runHook preBuild
+
+            $CC -std=c11 -Wall -Wextra -Werror \
+              -D_GNU_SOURCE \
+              -I${./src} \
+              ${./src/ahe_broker.c} \
+              -o ahe-broker
+
+            runHook postBuild
+          '';
+
+          installPhase = ''
+            runHook preInstall
+
+            install -D -m 0755 ahe-broker "$out/bin/ahe-broker"
+
+            runHook postInstall
+          '';
+
+          meta =
+            extension.meta
+            // {
+              description = "Shared-memory broker for Abyssal Hyperglyph Engine";
+              mainProgram = "ahe-broker";
+            };
+        };
+
         preCommitCheck = pre-commit-hooks.lib.${system}.run {
           src = repositorySource;
           hooks = {
@@ -253,10 +298,276 @@
           '
           touch "$out"
         '';
+
+        persistenceSmoke = pkgs.runCommand "abyssal-hyperglyph-engine-persistence-smoke" {} ''
+          broker_socket="$TMPDIR/ahe-broker.sock"
+          holder_pid=
+          ${aheBroker}/bin/ahe-broker --socket "$broker_socket" --max-clients 7 &
+          broker_pid=$!
+
+          cleanup_broker() {
+            if [[ -n "''${holder_pid:-}" ]]; then
+              kill "$holder_pid" 2>/dev/null || true
+              wait "$holder_pid" 2>/dev/null || true
+            fi
+            kill "$broker_pid" 2>/dev/null || true
+            wait "$broker_pid" 2>/dev/null || true
+          }
+          trap cleanup_broker EXIT
+
+          for attempt in {1..100}; do
+            if [[ -S "$broker_socket" ]]; then
+              break
+            fi
+            sleep 0.01
+          done
+          if [[ ! -S "$broker_socket" ]]; then
+            echo "The AHE broker did not create its socket." >&2
+            exit 1
+          fi
+
+          if AHE_BROKER_SOCKET="$broker_socket" \
+            AHE_CACHE_NAMESPACE="nix-persistence-smoke" \
+              ${aheLauncher}/bin/ahe-php \
+                -d opcache.preload=/definitely/missing/ahe-preload.php \
+                -r 'exit(0);'; then
+            echo "The deliberately broken creator unexpectedly succeeded." >&2
+            exit 1
+          fi
+
+          AHE_BROKER_SOCKET="$broker_socket" \
+          AHE_CACHE_NAMESPACE="nix-persistence-smoke" \
+            ${aheLauncher}/bin/ahe-php \
+              -d opcache.file_update_protection=0 \
+              ${./tests/integration/cache-create.php} \
+              ${./tests/fixtures/persistent.php}
+
+          AHE_BROKER_SOCKET="$broker_socket" \
+          AHE_CACHE_NAMESPACE="nix-persistence-smoke" \
+          AHE_FIXTURE=${./tests/fixtures/persistent.php} \
+            ${aheLauncher}/bin/ahe-php \
+              -d opcache.file_update_protection=0 \
+              -d opcache.interned_strings_buffer=16 \
+              -r '
+                $fixture = realpath((string) getenv("AHE_FIXTURE"));
+                if ($fixture === false || opcache_get_status(false) === false) {
+                  fwrite(STDERR, "OPcache did not fall back for a layout mismatch.\n");
+                  exit(1);
+                }
+                if (opcache_is_script_cached($fixture)) {
+                  fwrite(STDERR, "The layout-mismatched process attached to the retained generation.\n");
+                  exit(1);
+                }
+              '
+
+          AHE_BROKER_SOCKET="$broker_socket" \
+          AHE_CACHE_NAMESPACE="nix-persistence-smoke" \
+          AHE_FIXTURE=${./tests/fixtures/persistent.php} \
+            ${aheLauncher}/bin/ahe-php \
+              -d opcache.file_update_protection=0 \
+              -d opcache.memory_consumption=256 \
+              -r '
+                $fixture = realpath((string) getenv("AHE_FIXTURE"));
+                if ($fixture === false || opcache_get_status(false) === false) {
+                  fwrite(STDERR, "OPcache did not fall back for an incompatible cache key.\n");
+                  exit(1);
+                }
+                if (opcache_is_script_cached($fixture)) {
+                  fwrite(STDERR, "The size-mismatched process attached to the retained generation.\n");
+                  exit(1);
+                }
+              '
+
+          hold_marker="$TMPDIR/ahe-holder-ready"
+          AHE_BROKER_SOCKET="$broker_socket" \
+          AHE_CACHE_NAMESPACE="nix-persistence-smoke" \
+          AHE_HOLD_MARKER="$hold_marker" \
+            ${aheLauncher}/bin/ahe-php \
+              -d opcache.file_update_protection=0 \
+              -r '
+                file_put_contents((string) getenv("AHE_HOLD_MARKER"), "ready");
+                sleep(3);
+              ' &
+          holder_pid=$!
+
+          for attempt in {1..100}; do
+            if [[ -f "$hold_marker" ]]; then
+              break
+            fi
+            sleep 0.01
+          done
+          if [[ ! -f "$hold_marker" ]]; then
+            echo "The cache-holding PHP process did not start." >&2
+            exit 1
+          fi
+
+          AHE_BROKER_SOCKET="$broker_socket" \
+          AHE_CACHE_NAMESPACE="nix-persistence-smoke" \
+          AHE_FIXTURE=${./tests/fixtures/persistent.php} \
+            ${aheLauncher}/bin/ahe-php \
+              -d opcache.file_update_protection=0 \
+              -r '
+                $fixture = realpath((string) getenv("AHE_FIXTURE"));
+                if ($fixture === false || opcache_get_status(false) === false) {
+                  fwrite(STDERR, "The contending process did not fall back to local OPcache.\n");
+                  exit(1);
+                }
+                if (opcache_is_script_cached($fixture)) {
+                  fwrite(STDERR, "The contending process unexpectedly attached to the busy broker.\n");
+                  exit(1);
+                }
+              '
+
+          wait "$holder_pid"
+          holder_pid=
+
+          AHE_BROKER_SOCKET="$broker_socket" \
+          AHE_CACHE_NAMESPACE="nix-persistence-smoke" \
+            ${aheLauncher}/bin/ahe-php \
+              -d opcache.file_update_protection=0 \
+              ${./tests/integration/cache-attach.php} \
+              ${./tests/fixtures/persistent.php}
+
+          wait "$broker_pid"
+          trap - EXIT
+          touch "$out"
+        '';
+
+        brokerLifecycleSmoke = pkgs.runCommand "abyssal-hyperglyph-engine-broker-lifecycle-smoke" {} ''
+          broker_pid=
+          php_pid=
+          watchdog_pid=
+
+          cleanup_processes() {
+            for process_id in "''${php_pid:-}" "''${broker_pid:-}" "''${watchdog_pid:-}"; do
+              if [[ -n "$process_id" ]]; then
+                kill "$process_id" 2>/dev/null || true
+                wait "$process_id" 2>/dev/null || true
+              fi
+            done
+          }
+          trap cleanup_processes EXIT
+
+          insecure_directory="$TMPDIR/insecure"
+          mkdir "$insecure_directory"
+          chmod 0777 "$insecure_directory"
+          if ${aheBroker}/bin/ahe-broker \
+            --socket "$insecure_directory/broker.sock" \
+            --max-clients 1; then
+            echo "The broker accepted an unsafe parent directory." >&2
+            exit 1
+          fi
+
+          broker_socket="$TMPDIR/lifecycle/ahe-broker.sock"
+          hold_marker="$TMPDIR/lifecycle-holder-ready"
+          ${aheBroker}/bin/ahe-broker --socket "$broker_socket" &
+          broker_pid=$!
+          for attempt in {1..100}; do
+            [[ -S "$broker_socket" ]] && break
+            sleep 0.01
+          done
+          if [[ ! -S "$broker_socket" ]]; then
+            echo "The lifecycle broker did not create its socket." >&2
+            exit 1
+          fi
+
+          AHE_BROKER_SOCKET="$broker_socket" \
+          AHE_CACHE_NAMESPACE="nix-lifecycle-smoke" \
+          AHE_HOLD_MARKER="$hold_marker" \
+            ${aheLauncher}/bin/ahe-php -r '
+              file_put_contents((string) getenv("AHE_HOLD_MARKER"), "ready");
+              sleep(30);
+            ' &
+          php_pid=$!
+          for attempt in {1..100}; do
+            [[ -f "$hold_marker" ]] && break
+            sleep 0.01
+          done
+          if [[ ! -f "$hold_marker" ]]; then
+            echo "The lifecycle client did not reach user code." >&2
+            exit 1
+          fi
+
+          kill -TERM "$broker_pid"
+          timeout_marker="$TMPDIR/broker-shutdown-timed-out"
+          (
+            sleep 2
+            touch "$timeout_marker"
+            kill -KILL "$broker_pid" 2>/dev/null || true
+          ) &
+          watchdog_pid=$!
+          wait "$broker_pid" || true
+          broker_pid=
+          kill "$watchdog_pid" 2>/dev/null || true
+          wait "$watchdog_pid" 2>/dev/null || true
+          watchdog_pid=
+          if [[ -e "$timeout_marker" ]]; then
+            echo "The broker ignored SIGTERM while a client was connected." >&2
+            exit 1
+          fi
+          kill "$php_pid" 2>/dev/null || true
+          wait "$php_pid" 2>/dev/null || true
+          php_pid=
+
+          ${aheBroker}/bin/ahe-broker --socket "$broker_socket" &
+          broker_pid=$!
+          for attempt in {1..100}; do
+            [[ -S "$broker_socket" ]] && break
+            sleep 0.01
+          done
+          kill -KILL "$broker_pid"
+          wait "$broker_pid" 2>/dev/null || true
+          broker_pid=
+          if [[ ! -S "$broker_socket" ]]; then
+            echo "The forced broker exit did not leave a socket for the restart test." >&2
+            exit 1
+          fi
+          if grep -Fq -- "$broker_socket" /proc/net/unix; then
+            echo "The killed broker unexpectedly retained a live Unix socket." >&2
+            exit 1
+          fi
+
+          ${aheBroker}/bin/ahe-broker --socket "$broker_socket" --max-clients 1 &
+          broker_pid=$!
+          replacement_ready=false
+          for attempt in {1..100}; do
+            if [[ -S "$broker_socket" ]] \
+              && grep -Fq -- "$broker_socket" /proc/net/unix; then
+              replacement_ready=true
+              break
+            fi
+            sleep 0.01
+          done
+          if [[ "$replacement_ready" != true ]]; then
+            echo "The broker did not recover its stale socket." >&2
+            exit 1
+          fi
+
+          chmod 0666 "$broker_socket"
+          AHE_BROKER_SOCKET="$broker_socket" \
+          AHE_CACHE_NAMESPACE="nix-lifecycle-smoke" \
+            ${aheLauncher}/bin/ahe-php -r '
+              if (opcache_get_status(false) === false) {
+                fwrite(STDERR, "OPcache did not fall back for an unsafe broker socket.\n");
+                exit(1);
+              }
+            '
+          chmod 0600 "$broker_socket"
+
+          AHE_BROKER_SOCKET="$broker_socket" \
+          AHE_CACHE_NAMESPACE="nix-lifecycle-smoke" \
+            ${aheLauncher}/bin/ahe-php -r 'exit(0);'
+          wait "$broker_pid"
+          broker_pid=
+
+          trap - EXIT
+          touch "$out"
+        '';
       in {
         packages = {
           default = extension;
           inherit extension;
+          ahe-broker = aheBroker;
           ahe-php = aheLauncher;
           php = phpWithAhe;
         };
@@ -267,9 +578,17 @@
           meta.description = "ASLR-disabled PHP with Abyssal Hyperglyph Engine enabled";
         };
 
+        apps.broker = {
+          type = "app";
+          program = "${aheBroker}/bin/ahe-broker";
+          meta.description = "Shared-memory broker for Abyssal Hyperglyph Engine";
+        };
+
         checks = {
           inherit extension;
+          broker-lifecycle-smoke = brokerLifecycleSmoke;
           launcher-smoke = launcherSmoke;
+          persistence-smoke = persistenceSmoke;
           pre-commit = preCommitCheck;
           provider-lifetime-smoke = providerLifetimeSmoke;
           wrapper-smoke = wrapperSmoke;
@@ -281,6 +600,7 @@
             actionlint
             clang-tools
             gdb
+            aheBroker
             aheLauncher
             phpWithAhe
             php.unwrapped.dev
