@@ -26,6 +26,7 @@ in {
       ./sources.nix
       ../patches/php/8.4/0001-external-shared-memory-provider.patch
       ../scripts/benchmark-phpstan.sh
+      ../scripts/reproduce-class-linking.sh
       ../scripts/smoke-test.sh
       ../src/ahe_broker.c
       ../src/ahe_broker_client.c
@@ -36,12 +37,15 @@ in {
       ../src/abyssal_hyperglyph_engine.c
       ../src/abyssal_hyperglyph_engine.h
       ../tests/001-load.phpt
+      ../tests/fixtures/class-linking.php
       ../tests/fixtures/concurrent.php
       ../tests/fixtures/persistent.php
       ../tests/fixtures/phpstan-source.php
       ../tests/integration/broker-stall.c
       ../tests/integration/cache-attach.php
       ../tests/integration/cache-create.php
+      ../tests/integration/class-linking-attach.php
+      ../tests/integration/class-linking-create.php
       ../tests/integration/phpstan-worker-bootstrap.php
       ../tests/integration/phpstan.neon
     ];

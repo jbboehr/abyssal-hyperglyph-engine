@@ -19,6 +19,8 @@ independently executed PHPStan workers can fault while binding classes restored
 from shared OPcache. The script emits no benchmark summary unless the prime and
 its attachment probe both succeed, so this known failure cannot be reported as
 a speedup. See the architecture document for the current diagnosis.
+The smaller `scripts/reproduce-class-linking.sh` case exercises the same class
+of failure using one cached class that extends an internal PHP class.
 
 The checkout, installed Composer dependencies, logs, metadata, raw TSV samples,
 and summary stay under the benchmark cache directory printed by the script.

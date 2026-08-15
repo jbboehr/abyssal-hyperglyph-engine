@@ -90,6 +90,18 @@ result cache cold and warm. See
 controls, the immutable-PHAR OPcache profile, and the real-project class-linking
 regression that currently prevents timing from starting.
 
+Reproduce the underlying class-linking fault without PHPStan:
+
+```console
+nix develop
+scripts/reproduce-class-linking.sh
+```
+
+The attacher currently exits from a segmentation fault. The script uses a fixed
+private path because the stale metadata is layout-sensitive; see the
+architecture notes for the one-class reduction and the relevant PHP core
+reattachment safeguard.
+
 Enter the development environment:
 
 ```console
