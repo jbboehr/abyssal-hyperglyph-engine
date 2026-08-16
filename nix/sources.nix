@@ -13,6 +13,7 @@ in {
       ../LICENSE.md
       ../README.md
       ../benchmarks/phpstan/README.md
+      ../benchmarks/phpstan/file-cache/opcache.ini
       ../benchmarks/phpstan/jit-function/opcache.ini
       ../benchmarks/phpstan/jit/opcache.ini
       ../benchmarks/phpstan/opcache-status.php

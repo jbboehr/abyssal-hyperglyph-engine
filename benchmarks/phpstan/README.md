@@ -10,7 +10,7 @@ Run it from the development shell:
 
 ```console
 nix develop
-scripts/benchmark-phpstan.sh --samples 7
+scripts/benchmark-phpstan.sh --samples 8
 ```
 
 This also provides real-world regression coverage for cross-process class
@@ -32,10 +32,12 @@ Completed development measurements and their interpretation are recorded in
 
 ## Cache controls
 
-The harness runs seven modes with the same patched PHP binary and extension set:
+The harness runs eight modes with the same patched PHP binary and extension set:
 
 - `vanilla`: CLI OPcache disabled;
 - `opcache`: ordinary process-local CLI OPcache;
+- `opcache-file-cache`: OPcache's stock persistent file cache in
+  `file_cache_only` mode, with JIT disabled;
 - `opcache-jit`: process-local OPcache with a 64 MiB tracing JIT buffer;
 - `opcache-jit-function`: process-local OPcache with PHP's whole-function,
   compile-on-script-load JIT preset;
@@ -45,7 +47,11 @@ The harness runs seven modes with the same patched PHP binary and extension set:
 - `ahe-jit-function`: a third broker-retained generation with the same
   whole-function JIT profile as `opcache-jit-function`.
 
-The process-local JIT modes isolate each JIT strategy's effect from persistence.
+The file-cache mode is a no-PHP-patch persistence baseline: it serializes
+optimized bytecode to disk, but PHP 8.4 disables JIT in `file_cache_only` mode.
+Comparing it with `ahe` isolates the value of retaining OPcache in memory from
+the value of persistence alone. The process-local JIT modes isolate each JIT
+strategy's effect from persistence.
 Comparing `ahe-jit` with `opcache-jit` isolates the effect of retaining a
 tracing-JIT cache; comparing `ahe-jit-function` with
 `opcache-jit-function` isolates the effect of retaining whole-function JIT.
@@ -63,18 +69,22 @@ PHPStan's generated dependency-injection container remains warm and at the same
 path throughout, so it is not confused with the result cache. A Latin-square
 order puts every mode in every execution position and varies its neighbors to
 reduce ordering and carryover bias. Sample counts must be a
-multiple of the seven modes so the harness always executes complete
+multiple of the eight modes so the harness always executes complete
 counterbalancing blocks. Each AHE generation is primed with a complete,
 result-cache-cold analysis before sample collection; these cache-populating
 invocations are timed and reported separately rather than mixed with attached
 samples. Before warm-result-cache samples begin, each retained generation
 processes that snapshot once so the result-cache PHP file itself is already
-represented in OPcache; this transition is validated but not mixed into the
-steady-state timings.
+represented in OPcache. The persistent file cache receives the same transition;
+these warmups are validated but not mixed into the steady-state timings.
 
 Every mode loads the same file through PHPStan's `--autoload-file` option so the
 result-cache configuration is identical. It asserts the expected JIT state in
-every parent and worker; in AHE modes it also asserts attachment. A process that
+every parent and worker; in AHE modes it also asserts attachment. File-cache
+processes require a primed probe after its source value has changed, so a
+successful assertion proves that persisted bytecode was deserialized rather
+than recompiled locally. The prime must also produce cached PHPStan PHAR and
+PHPUnit project entries before sampling begins. A process that
 cannot find the AHE `memfd` mapping exits immediately, and each timed AHE sample
 must produce a fresh parent marker before it can be recorded. A post-sample
 probe additionally compares the retained JIT buffer with a baseline captured

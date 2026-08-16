@@ -15,9 +15,9 @@ All recorded runs used:
 - PHPStan Turbo disabled so the parent and workers had the same extension
   layout.
 
-The first three runs used five samples per result-cache state and mode. The
-current run uses the six samples required to complete the six-mode
-counterbalancing block.
+Early exploratory runs used five samples per result-cache state and mode. Later
+harness versions require one complete block: six samples for six modes, seven
+for seven modes, and eight for the current eight-mode matrix.
 
 `cold` means the PHPStan result-cache file was absent before each sample.
 `warm` means the same primed result-cache snapshot was restored before each
@@ -27,8 +27,9 @@ separately.
 The current harness also checks the exact JIT mode in every parent and worker,
 requires every AHE sample to prove that it attached to the broker's `memfd`,
 compares JIT use against a pre-workload startup baseline, and rejects full or
-restarting retained caches. It requires complete six-row counterbalancing
-blocks. See
+restarting retained caches. The file-cache baseline additionally proves a
+persisted bytecode hit in every process and validates the populated cache
+manifest. It requires complete counterbalancing blocks. See
 [`benchmarks/phpstan/README.md`](../../benchmarks/phpstan/README.md) for the full
 methodology.
 
@@ -120,8 +121,8 @@ makes that fixed cost especially visible.
 
 Artifact ID: `20260815T193826Z`
 
-This is the current reference run. It used a complete six-row counterbalancing
-block and the stronger JIT-emission guard. Metadata recorded AHE base revision
+This was the first complete six-row reference run. It used the stronger
+JIT-emission guard. Metadata recorded AHE base revision
 `c08678d9f71d1e3697de5a5ab406980a124ada55`, a dirty benchmark worktree, Linux
 7.1.5-xanmod1, and an AMD Ryzen 9 9950X3D.
 
@@ -252,3 +253,67 @@ avoids the severe per-process compilation penalty, but not that every eligible
 PHPStan function was compiled. A follow-up should sweep larger JIT buffers on a
 quiet host and report both saturation and timing before choosing a recommended
 PHPStan profile.
+
+## 2026-08-16 00:03 UTC: stock persistent file-cache baseline
+
+Artifact ID: `20260816T000325Z`
+
+This is the current reference run. It added OPcache's stock
+`file_cache_only` mode and used one complete eight-row counterbalancing block.
+The file cache was primed by a separate cold analysis, then an untimed warm
+transition cached PHPStan's restored result-cache script before warm sampling,
+matching the transition already performed for each AHE generation.
+
+Every file-cache process required a probe whose source had changed after the
+prime and asserted the original return value. This proves bytecode
+deserialization instead of successful process-local fallback. The prime
+created 5,495 `.bin` files, including 2,417 PHPStan PHAR entries and executable
+files from PHPUnit's `src` tree. All AHE attachment, exact-JIT-mode,
+workload-emission, and cache-health guards also passed.
+
+Metadata recorded PHP 8.4.24, PHPStan 2.2.6, AHE base revision
+`276e653a2cec3d7c37d4b8ebefada2f90938ba4b`, Linux 7.1.5-xanmod1, and an AMD
+Ryzen 9 9950X3D. The worktree was dirty because it contained the eight-mode
+harness changes. Other host activity caused visible early-row noise, so the
+counterbalanced medians are more useful than individual samples.
+
+| Result cache | Mode | Median time | Median max RSS | Speedup versus vanilla |
+| --- | --- | ---: | ---: | ---: |
+| cold | vanilla | 4.443 s | 200,410 KiB | — |
+| cold | process-local OPcache | 4.524 s | 235,074 KiB | -1.8% |
+| cold | persistent OPcache file cache | 4.018 s | 245,150 KiB | 9.6% |
+| cold | process-local tracing JIT | 4.934 s | 274,842 KiB | -11.1% |
+| cold | process-local function JIT | 12.872 s | 330,688 KiB | -189.7% |
+| cold | AHE | 3.737 s | 232,670 KiB | 15.9% |
+| cold | AHE plus tracing JIT | 3.718 s | 253,618 KiB | 16.3% |
+| cold | AHE plus function JIT | 2.791 s | 292,484 KiB | 37.2% |
+| warm | vanilla | 0.290 s | 162,246 KiB | — |
+| warm | process-local OPcache | 0.501 s | 182,222 KiB | -72.8% |
+| warm | persistent OPcache file cache | 0.314 s | 148,150 KiB | -8.3% |
+| warm | process-local tracing JIT | 0.609 s | 216,366 KiB | -110.0% |
+| warm | process-local function JIT | 3.864 s | 255,028 KiB | -1232.4% |
+| warm | AHE | 0.281 s | 134,848 KiB | 3.1% |
+| warm | AHE plus tracing JIT | 0.268 s | 153,278 KiB | 7.6% |
+| warm | AHE plus function JIT | 0.284 s | 171,578 KiB | 2.1% |
+
+Stock file-cache persistence explains a meaningful part, but not all, of AHE's
+bytecode-only result. It was 9.6% faster than vanilla on the cold-result-cache
+workload; plain AHE was another 7.0% faster than file cache and used 5.1% less
+median max RSS. With a warm PHPStan result cache, file-cache deserialization
+cost more than vanilla, while AHE was 10.5% faster than file cache and used 9.0%
+less median max RSS.
+
+The larger distinction remains machine-code retention. AHE plus whole-function
+JIT was 30.5% faster than stock file cache and 25.3% faster than plain AHE on
+the cold workload. It was effectively tied with plain AHE on the warm workload,
+where PHPStan's result cache leaves little code to execute. Its one-time prime
+took 7.475 s and again exhausted the 64 MiB JIT buffer; the tracing generation
+used only about 1 MiB beyond startup.
+
+This narrows the project's value proposition. Persistent optimized bytecode by
+itself offers only a modest advantage over PHP's existing disk cache. Safe
+cross-process retention of whole-function JIT code produces the substantial
+cold-analysis gain that stock PHP 8.4 cannot provide. The next useful
+experiment is therefore a larger function-JIT buffer sweep, measuring prime
+cost, saturation, cold time, and memory rather than adding more bytecode-cache
+machinery.

@@ -8,27 +8,28 @@ readonly phpunit_commit='b98e028a26c5c5ba7e4a54be96ccf35f2914d184'
 readonly -a benchmark_modes=(
   vanilla
   opcache
+  opcache-file-cache
   opcache-jit
   opcache-jit-function
   ahe
   ahe-jit
   ahe-jit-function
 )
-readonly -a balanced_mode_offsets=(0 1 6 2 5 3 4)
+readonly -a balanced_mode_offsets=(0 1 7 2 6 3 5 4)
 readonly counterbalance_block_size=${#benchmark_modes[@]}
 
 usage() {
   cat <<'EOF'
 Usage: scripts/benchmark-phpstan.sh [--samples COUNT]
 
-Benchmark vanilla PHP, process-local OPcache, and AHE, with and without JIT,
-on PHPUnit's PHPStan analysis.
-The sample count must be a multiple of 7. The default is
-AHE_BENCHMARK_SAMPLES or 7.
+Benchmark vanilla PHP, process-local OPcache, OPcache's persistent file cache,
+and AHE, with and without JIT, on PHPUnit's PHPStan analysis.
+The sample count must be a multiple of 8. The default is
+AHE_BENCHMARK_SAMPLES or 8.
 EOF
 }
 
-samples=${AHE_BENCHMARK_SAMPLES:-7}
+samples=${AHE_BENCHMARK_SAMPLES:-8}
 while (($#)); do
   case $1 in
     --samples)
@@ -64,6 +65,7 @@ fi
 repository_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 benchmark_ini_directory="$repository_root/benchmarks/phpstan"
 vanilla_ini_directory="$benchmark_ini_directory/vanilla"
+file_cache_ini_directory="$benchmark_ini_directory/file-cache"
 tracing_jit_ini_directory="$benchmark_ini_directory/jit"
 function_jit_ini_directory="$benchmark_ini_directory/jit-function"
 probe_script="$benchmark_ini_directory/opcache-status.php"
@@ -158,6 +160,10 @@ runtime_directory=$(mktemp -d /tmp/ahe-phpstan-benchmark.XXXXXX)
 broker_socket="$runtime_directory/ahe-broker.sock"
 jit_broker_socket="$runtime_directory/ahe-jit-broker.sock"
 function_jit_broker_socket="$runtime_directory/ahe-jit-function-broker.sock"
+file_cache_directory="$runtime_directory/opcache-file-cache"
+file_cache_probe="$runtime_directory/opcache-file-cache-probe.php"
+file_cache_runtime_ini_directory="$runtime_directory/file-cache-ini"
+file_cache_php_ini_scan_path="$opcache_php_ini_scan_path:$file_cache_ini_directory:$file_cache_runtime_ini_directory"
 phpstan_tmp_directory="$runtime_directory/phpstan-tmp"
 result_cache="$phpstan_tmp_directory/phpstan/phpunit-12.5.php"
 result_cache_snapshot="$runtime_directory/phpunit-12.5.snapshot.php"
@@ -167,6 +173,10 @@ primes_file="$result_directory/primes.tsv"
 declare -a broker_pids=()
 ahe_jit_startup_buffer_free=
 ahe_jit_function_startup_buffer_free=
+
+mkdir -p "$file_cache_runtime_ini_directory" "$file_cache_directory"
+printf 'opcache.file_cache="%s"\n' "$file_cache_directory" \
+  >"$file_cache_runtime_ini_directory/opcache-file-cache-directory.ini"
 
 cleanup() {
   local broker_pid
@@ -190,10 +200,16 @@ mode_uses_ahe() {
 build_analysis_command() {
   local mode=$1
   local attachment_directory=${2:-}
+  local expect_file_cache=0
   local expect_jit_mode=off
   local mode_php_ini_scan_path=$opcache_php_ini_scan_path
   local -a mode_arguments=("--autoload-file=$attachment_probe")
-  analysis_command=(env -C "$checkout_directory")
+  analysis_command=(
+    env -C "$checkout_directory"
+    -u AHE_BENCHMARK_FILE_CACHE_DIRECTORY
+    -u AHE_BENCHMARK_FILE_CACHE_MARKER_DIRECTORY
+    -u AHE_BENCHMARK_FILE_CACHE_PROBE
+  )
 
   case $mode in
     vanilla)
@@ -208,6 +224,23 @@ build_analysis_command() {
       analysis_command+=(
         -u AHE_BROKER_SOCKET
         -u AHE_CACHE_NAMESPACE
+        AHE_BENCHMARK_EXPECT_ATTACHMENT=0
+      )
+      ;;
+    opcache-file-cache)
+      if [[ -z "$attachment_directory" ]]; then
+        echo "A file-cache analysis requires a fresh hit-marker directory." >&2
+        return 2
+      fi
+      mkdir "$attachment_directory"
+      mode_php_ini_scan_path=$file_cache_php_ini_scan_path
+      expect_file_cache=1
+      analysis_command+=(
+        -u AHE_BROKER_SOCKET
+        -u AHE_CACHE_NAMESPACE
+        "AHE_BENCHMARK_FILE_CACHE_DIRECTORY=$file_cache_directory"
+        "AHE_BENCHMARK_FILE_CACHE_MARKER_DIRECTORY=$attachment_directory"
+        "AHE_BENCHMARK_FILE_CACHE_PROBE=$file_cache_probe"
         AHE_BENCHMARK_EXPECT_ATTACHMENT=0
       )
       ;;
@@ -279,6 +312,7 @@ build_analysis_command() {
   esac
 
   analysis_command+=(
+    "AHE_BENCHMARK_EXPECT_FILE_CACHE=$expect_file_cache"
     "AHE_BENCHMARK_EXPECT_JIT_MODE=$expect_jit_mode"
     "PHP_INI_SCAN_DIR=$mode_php_ini_scan_path"
     "PHPSTAN_TURBO=0"
@@ -310,6 +344,18 @@ verify_ahe_attachments() {
   if [[ "$parent_count" -ne 1 ]]; then
     printf 'Expected one attached PHPStan parent, found %s in %s\n' \
       "$parent_count" "$attachment_directory" >&2
+    return 1
+  fi
+}
+
+verify_file_cache_hits() {
+  local marker_directory=$1
+  local parent_count
+
+  parent_count=$(find "$marker_directory" -maxdepth 1 -type f -name 'parent-*' | wc -l)
+  if [[ "$parent_count" -ne 1 ]]; then
+    printf 'Expected one PHPStan parent with a proven file-cache hit, found %s in %s\n' \
+      "$parent_count" "$marker_directory" >&2
     return 1
   fi
 }
@@ -388,7 +434,7 @@ run_timed() {
   local attachment_directory=
 
   prepare_result_cache "$cache_state"
-  if mode_uses_ahe "$mode"; then
+  if mode_uses_ahe "$mode" || [[ "$mode" == opcache-file-cache ]]; then
     attachment_directory="$runtime_directory/attachments-$cache_state-$mode-$iteration"
   fi
   build_analysis_command "$mode" "$attachment_directory"
@@ -400,6 +446,12 @@ run_timed() {
     finished_nanoseconds=$(date +%s%N)
     if mode_uses_ahe "$mode" && ! verify_ahe_attachments "$attachment_directory"; then
       printf 'The %s/AHE sample %s did not prove attachment; see %s\n' \
+        "$cache_state" "$iteration" "$log_file" >&2
+      return 1
+    fi
+    if [[ "$mode" == opcache-file-cache ]] \
+      && ! verify_file_cache_hits "$attachment_directory"; then
+      printf 'The %s/file-cache sample %s did not prove a persisted bytecode hit; see %s\n' \
         "$cache_state" "$iteration" "$log_file" >&2
       return 1
     fi
@@ -499,6 +551,21 @@ fi
 if ! PHP_INI_SCAN_DIR="$vanilla_php_ini_scan_path" "$ahe_php" -r '
     if (filter_var(ini_get("opcache.enable_cli"), FILTER_VALIDATE_BOOL)) {
         fwrite(STDERR, "Vanilla mode did not disable CLI OPcache.\n");
+        exit(1);
+    }
+  '; then
+  exit 1
+fi
+
+if ! env \
+  "AHE_BENCHMARK_FILE_CACHE_DIRECTORY=$file_cache_directory" \
+  "PHP_INI_SCAN_DIR=$file_cache_php_ini_scan_path" \
+  "$ahe_php" -r '
+    if (!filter_var(ini_get("opcache.file_cache_only"), FILTER_VALIDATE_BOOL)
+        || ini_get("opcache.file_cache") !== getenv("AHE_BENCHMARK_FILE_CACHE_DIRECTORY")
+        || ini_get("opcache.jit_buffer_size") !== "0"
+    ) {
+        fwrite(STDERR, "Persistent file-cache mode did not load its expected settings.\n");
         exit(1);
     }
   '; then
@@ -698,6 +765,57 @@ EOF
     | tee -a "$primes_file"
 }
 
+run_file_cache_prime() {
+  local marker_directory="$runtime_directory/attachments-opcache-file-cache-prime"
+  local log_file="$result_directory/opcache-file-cache-prime.log"
+  local elapsed_seconds
+  local file_cache_file_count
+  local finished_nanoseconds
+  local max_rss_kb
+  local started_nanoseconds
+
+  mkdir -p "$file_cache_directory"
+  printf '<?php return 111;\n' >"$file_cache_probe"
+  prepare_result_cache cold
+  build_analysis_command opcache-file-cache "$marker_directory"
+  started_nanoseconds=$(date +%s%N)
+  if ! "$time_binary" \
+    --output="$timing_file" \
+    --format='%M' \
+    "${analysis_command[@]}" >"$log_file" 2>&1; then
+    printf 'The persistent file-cache prime failed; see %s\n' "$log_file" >&2
+    return 1
+  fi
+  finished_nanoseconds=$(date +%s%N)
+  if ! verify_file_cache_hits "$marker_directory"; then
+    printf 'The persistent file-cache prime did not execute its probe.\n' >&2
+    return 1
+  fi
+
+  find "$file_cache_directory" -type f -name '*.bin' -printf '%P\n' \
+    | sort >"$result_directory/opcache-file-cache-manifest.txt"
+  file_cache_file_count=$(wc -l <"$result_directory/opcache-file-cache-manifest.txt")
+  if [[ "$file_cache_file_count" -eq 0 ]] \
+    || ! grep -Fq 'phpstan.phar/' "$result_directory/opcache-file-cache-manifest.txt" \
+    || ! grep -Fq "$checkout_directory/src/" "$result_directory/opcache-file-cache-manifest.txt"; then
+    printf 'The persistent file-cache prime did not retain PHPStan and PHPUnit scripts.\n' >&2
+    return 1
+  fi
+
+  # Every later process must return the bytecode-cached value (111), not this
+  # changed source value. That makes process-local fallback fail immediately.
+  printf '<?php return 222;\n' >"$file_cache_probe"
+  read -r max_rss_kb <"$timing_file"
+  elapsed_seconds=$(awk \
+    -v started="$started_nanoseconds" \
+    -v finished="$finished_nanoseconds" \
+    'BEGIN { printf "%.6f", (finished - started) / 1000000000 }')
+  printf '%s\t%s\t%s\n' opcache-file-cache "$elapsed_seconds" "$max_rss_kb" \
+    | tee -a "$primes_file"
+  printf 'opcache_file_cache_files=%s\n' "$file_cache_file_count" \
+    >>"$result_directory/metadata.txt"
+}
+
 warm_ahe_generation_for_result_cache() {
   local mode=$1
   local attachment_directory="$runtime_directory/attachments-$mode-result-cache-warmup"
@@ -719,10 +837,28 @@ warm_ahe_generation_for_result_cache() {
     "$result_directory/$mode-result-cache-warmup-opcache-status.json"
 }
 
+warm_file_cache_for_result_cache() {
+  local marker_directory="$runtime_directory/attachments-opcache-file-cache-result-cache-warmup"
+  local log_file="$result_directory/opcache-file-cache-result-cache-warmup.log"
+
+  prepare_result_cache warm
+  if ! run_analysis opcache-file-cache "$marker_directory" >"$log_file" 2>&1; then
+    printf 'The persistent file-cache warm-result-cache transition failed; see %s\n' \
+      "$log_file" >&2
+    return 1
+  fi
+  if ! verify_file_cache_hits "$marker_directory"; then
+    printf 'The persistent file-cache warm transition did not prove a bytecode hit.\n' >&2
+    return 1
+  fi
+}
+
 echo "Priming the retained AHE generations with result-cache-cold analyses..."
 run_ahe_prime ahe
 run_ahe_prime ahe-jit
 run_ahe_prime ahe-jit-function
+echo "Priming OPcache's persistent file cache with a result-cache-cold analysis..."
+run_file_cache_prime
 
 for cache_state in cold warm; do
   if [[ "$cache_state" == warm ]]; then
@@ -730,6 +866,7 @@ for cache_state in cold warm; do
     warm_ahe_generation_for_result_cache ahe
     warm_ahe_generation_for_result_cache ahe-jit
     warm_ahe_generation_for_result_cache ahe-jit-function
+    warm_file_cache_for_result_cache
   fi
   for ((iteration = 1; iteration <= samples; iteration++)); do
     for ((order_index = 0; order_index < ${#benchmark_modes[@]}; order_index++)); do
@@ -766,6 +903,9 @@ done
 
 comparison_from=(
   vanilla
+  vanilla
+  opcache
+  opcache-file-cache
   opcache
   opcache
   opcache
@@ -777,6 +917,9 @@ comparison_from=(
 )
 comparison_to=(
   opcache
+  opcache-file-cache
+  opcache-file-cache
+  ahe
   opcache-jit
   opcache-jit-function
   ahe
