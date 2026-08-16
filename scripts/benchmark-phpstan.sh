@@ -5,33 +5,31 @@ set -euo pipefail
 readonly phpunit_repository='https://github.com/sebastianbergmann/phpunit.git'
 readonly phpunit_tag='12.5.33'
 readonly phpunit_commit='b98e028a26c5c5ba7e4a54be96ccf35f2914d184'
-readonly -a benchmark_modes=(
-  vanilla
-  opcache
-  opcache-file-cache
-  opcache-jit
-  opcache-jit-function
-  ahe
-  ahe-jit
-  ahe-jit-function
-)
-readonly -a balanced_mode_offsets=(0 1 7 2 6 3 5 4)
-readonly counterbalance_block_size=${#benchmark_modes[@]}
 
 usage() {
   cat <<'EOF'
-Usage: scripts/benchmark-phpstan.sh [--samples COUNT]
+Usage: scripts/benchmark-phpstan.sh [--jit-buffer-sweep] [--samples COUNT]
 
 Benchmark vanilla PHP, process-local OPcache, OPcache's persistent file cache,
 and AHE, with and without JIT, on PHPUnit's PHPStan analysis.
-The sample count must be a multiple of 8. The default is
-AHE_BENCHMARK_SAMPLES or 8.
+
+By default, run the complete eight-mode cold/warm matrix. With
+--jit-buffer-sweep, run a focused cold-cache comparison of plain AHE and
+whole-function JIT with 64, 128, and 256 MiB buffers.
+
+The sample count must be a multiple of the selected mode count. It defaults to
+AHE_BENCHMARK_SAMPLES, or one complete counterbalancing block when unset.
 EOF
 }
 
-samples=${AHE_BENCHMARK_SAMPLES:-8}
+benchmark_suite=full
+samples=${AHE_BENCHMARK_SAMPLES:-}
 while (($#)); do
   case $1 in
+    --jit-buffer-sweep)
+      benchmark_suite=jit-buffer-sweep
+      shift
+      ;;
     --samples)
       if (($# < 2)); then
         echo "--samples requires a value" >&2
@@ -51,6 +49,45 @@ while (($#)); do
       ;;
   esac
 done
+
+declare -a benchmark_modes balanced_mode_offsets cache_states comparison_from comparison_to
+case $benchmark_suite in
+  full)
+    benchmark_modes=(
+      vanilla
+      opcache
+      opcache-file-cache
+      opcache-jit
+      opcache-jit-function
+      ahe
+      ahe-jit
+      ahe-jit-function
+    )
+    balanced_mode_offsets=(0 1 7 2 6 3 5 4)
+    cache_states=(cold warm)
+    summary_baseline_mode=vanilla
+    if [[ -z "$samples" ]]; then
+      samples=8
+    fi
+    ;;
+  jit-buffer-sweep)
+    benchmark_modes=(
+      ahe
+      ahe-jit-function-64m
+      ahe-jit-function-128m
+      ahe-jit-function-256m
+    )
+    balanced_mode_offsets=(0 1 3 2)
+    cache_states=(cold)
+    summary_baseline_mode=ahe
+    if [[ -z "$samples" ]]; then
+      samples=4
+    fi
+    ;;
+esac
+readonly benchmark_suite samples summary_baseline_mode
+readonly -a benchmark_modes balanced_mode_offsets cache_states
+readonly counterbalance_block_size=${#benchmark_modes[@]}
 
 if [[ ! "$samples" =~ ^[1-9][0-9]*$ ]]; then
   echo "The sample count must be a positive integer." >&2
@@ -160,23 +197,57 @@ runtime_directory=$(mktemp -d /tmp/ahe-phpstan-benchmark.XXXXXX)
 broker_socket="$runtime_directory/ahe-broker.sock"
 jit_broker_socket="$runtime_directory/ahe-jit-broker.sock"
 function_jit_broker_socket="$runtime_directory/ahe-jit-function-broker.sock"
+function_jit_128_broker_socket="$runtime_directory/ahe-jit-function-128m-broker.sock"
+function_jit_256_broker_socket="$runtime_directory/ahe-jit-function-256m-broker.sock"
 file_cache_directory="$runtime_directory/opcache-file-cache"
 file_cache_probe="$runtime_directory/opcache-file-cache-probe.php"
 file_cache_runtime_ini_directory="$runtime_directory/file-cache-ini"
 file_cache_php_ini_scan_path="$opcache_php_ini_scan_path:$file_cache_ini_directory:$file_cache_runtime_ini_directory"
+function_jit_128_ini_directory="$runtime_directory/jit-function-128m-ini"
+function_jit_256_ini_directory="$runtime_directory/jit-function-256m-ini"
+function_jit_128_php_ini_scan_path="$function_jit_php_ini_scan_path:$function_jit_128_ini_directory"
+function_jit_256_php_ini_scan_path="$function_jit_php_ini_scan_path:$function_jit_256_ini_directory"
 phpstan_tmp_directory="$runtime_directory/phpstan-tmp"
+blacklist_ini_directory="$runtime_directory/opcache-blacklist-ini"
+blacklist_file="$runtime_directory/phpstan-opcache.blacklist"
 result_cache="$phpstan_tmp_directory/phpstan/phpunit-12.5.php"
 result_cache_snapshot="$runtime_directory/phpunit-12.5.snapshot.php"
 timing_file="$runtime_directory/timing.tsv"
 samples_file="$result_directory/samples.tsv"
 primes_file="$result_directory/primes.tsv"
+idle_probes_file="$result_directory/idle-probes.tsv"
 declare -a broker_pids=()
 ahe_jit_startup_buffer_free=
 ahe_jit_function_startup_buffer_free=
+ahe_jit_function_128_startup_buffer_free=
+ahe_jit_function_256_startup_buffer_free=
 
-mkdir -p "$file_cache_runtime_ini_directory" "$file_cache_directory"
+mkdir -p \
+  "$file_cache_runtime_ini_directory" \
+  "$file_cache_directory" \
+  "$function_jit_128_ini_directory" \
+  "$function_jit_256_ini_directory" \
+  "$blacklist_ini_directory"
 printf 'opcache.file_cache="%s"\n' "$file_cache_directory" \
   >"$file_cache_runtime_ini_directory/opcache-file-cache-directory.ini"
+printf 'opcache.jit_buffer_size=128M\n' \
+  >"$function_jit_128_ini_directory/opcache-jit-buffer-size.ini"
+printf 'opcache.jit_buffer_size=256M\n' \
+  >"$function_jit_256_ini_directory/opcache-jit-buffer-size.ini"
+if [[ "$benchmark_suite" == jit-buffer-sweep ]]; then
+  printf '%s\n' \
+    "$phpstan_tmp_directory/phpstan/cache/nette.configurator/Container_*.php" \
+    >"$blacklist_file"
+  printf 'opcache.blacklist_filename="%s"\n' "$blacklist_file" \
+    >"$blacklist_ini_directory/opcache-blacklist.ini"
+  opcache_php_ini_scan_path="$opcache_php_ini_scan_path:$blacklist_ini_directory"
+  vanilla_php_ini_scan_path="$vanilla_php_ini_scan_path:$blacklist_ini_directory"
+  tracing_jit_php_ini_scan_path="$tracing_jit_php_ini_scan_path:$blacklist_ini_directory"
+  function_jit_php_ini_scan_path="$function_jit_php_ini_scan_path:$blacklist_ini_directory"
+  file_cache_php_ini_scan_path="$file_cache_php_ini_scan_path:$blacklist_ini_directory"
+  function_jit_128_php_ini_scan_path="$function_jit_128_php_ini_scan_path:$blacklist_ini_directory"
+  function_jit_256_php_ini_scan_path="$function_jit_256_php_ini_scan_path:$blacklist_ini_directory"
+fi
 
 cleanup() {
   local broker_pid
@@ -194,12 +265,32 @@ trap cleanup EXIT
 declare -a analysis_command
 
 mode_uses_ahe() {
-  [[ "$1" == ahe || "$1" == ahe-jit || "$1" == ahe-jit-function ]]
+  case $1 in
+    ahe|ahe-jit|ahe-jit-function|ahe-jit-function-64m|ahe-jit-function-128m|ahe-jit-function-256m)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+mode_is_enabled() {
+  local candidate
+  local expected_mode=$1
+
+  for candidate in "${benchmark_modes[@]}"; do
+    if [[ "$candidate" == "$expected_mode" ]]; then
+      return 0
+    fi
+  done
+  return 1
 }
 
 build_analysis_command() {
   local mode=$1
   local attachment_directory=${2:-}
+  local expect_blacklist=0
   local expect_file_cache=0
   local expect_jit_mode=off
   local mode_php_ini_scan_path=$opcache_php_ini_scan_path
@@ -210,6 +301,10 @@ build_analysis_command() {
     -u AHE_BENCHMARK_FILE_CACHE_MARKER_DIRECTORY
     -u AHE_BENCHMARK_FILE_CACHE_PROBE
   )
+
+  if [[ "$benchmark_suite" == jit-buffer-sweep ]]; then
+    expect_blacklist=1
+  fi
 
   case $mode in
     vanilla)
@@ -290,7 +385,7 @@ build_analysis_command() {
         AHE_BENCHMARK_EXPECT_ATTACHMENT=1
       )
       ;;
-    ahe-jit-function)
+    ahe-jit-function|ahe-jit-function-64m)
       if [[ -z "$attachment_directory" ]]; then
         echo "An AHE analysis requires a fresh attachment-marker directory." >&2
         return 2
@@ -305,6 +400,36 @@ build_analysis_command() {
         AHE_BENCHMARK_EXPECT_ATTACHMENT=1
       )
       ;;
+    ahe-jit-function-128m)
+      if [[ -z "$attachment_directory" ]]; then
+        echo "An AHE analysis requires a fresh attachment-marker directory." >&2
+        return 2
+      fi
+      mkdir "$attachment_directory"
+      mode_php_ini_scan_path=$function_jit_128_php_ini_scan_path
+      expect_jit_mode=function
+      analysis_command+=(
+        "AHE_BROKER_SOCKET=$function_jit_128_broker_socket"
+        "AHE_CACHE_NAMESPACE=phpunit-$phpunit_commit-jit-function-128m"
+        "AHE_BENCHMARK_ATTACHMENT_DIRECTORY=$attachment_directory"
+        AHE_BENCHMARK_EXPECT_ATTACHMENT=1
+      )
+      ;;
+    ahe-jit-function-256m)
+      if [[ -z "$attachment_directory" ]]; then
+        echo "An AHE analysis requires a fresh attachment-marker directory." >&2
+        return 2
+      fi
+      mkdir "$attachment_directory"
+      mode_php_ini_scan_path=$function_jit_256_php_ini_scan_path
+      expect_jit_mode=function
+      analysis_command+=(
+        "AHE_BROKER_SOCKET=$function_jit_256_broker_socket"
+        "AHE_CACHE_NAMESPACE=phpunit-$phpunit_commit-jit-function-256m"
+        "AHE_BENCHMARK_ATTACHMENT_DIRECTORY=$attachment_directory"
+        AHE_BENCHMARK_EXPECT_ATTACHMENT=1
+      )
+      ;;
     *)
       printf 'Unknown benchmark mode: %s\n' "$mode" >&2
       return 2
@@ -312,6 +437,8 @@ build_analysis_command() {
   esac
 
   analysis_command+=(
+    "AHE_BENCHMARK_BLACKLIST_FILE=$blacklist_file"
+    "AHE_BENCHMARK_EXPECT_BLACKLIST=$expect_blacklist"
     "AHE_BENCHMARK_EXPECT_FILE_CACHE=$expect_file_cache"
     "AHE_BENCHMARK_EXPECT_JIT_MODE=$expect_jit_mode"
     "PHP_INI_SCAN_DIR=$mode_php_ini_scan_path"
@@ -367,6 +494,8 @@ verify_ahe_cache() {
   local mode_broker_socket=$broker_socket
   local mode_cache_namespace=phpunit-$phpunit_commit
   local mode_php_ini_scan_path=$opcache_php_ini_scan_path
+  local script_baseline=
+  local expect_no_new_scripts=0
   local expect_jit_mode=off
 
   case $mode in
@@ -378,12 +507,26 @@ verify_ahe_cache() {
       expect_jit_mode=tracing
       jit_startup_buffer_free=$ahe_jit_startup_buffer_free
       ;;
-    ahe-jit-function)
+    ahe-jit-function|ahe-jit-function-64m)
       mode_broker_socket=$function_jit_broker_socket
       mode_cache_namespace=phpunit-$phpunit_commit-jit-function
       mode_php_ini_scan_path=$function_jit_php_ini_scan_path
       expect_jit_mode=function
       jit_startup_buffer_free=$ahe_jit_function_startup_buffer_free
+      ;;
+    ahe-jit-function-128m)
+      mode_broker_socket=$function_jit_128_broker_socket
+      mode_cache_namespace=phpunit-$phpunit_commit-jit-function-128m
+      mode_php_ini_scan_path=$function_jit_128_php_ini_scan_path
+      expect_jit_mode=function
+      jit_startup_buffer_free=$ahe_jit_function_128_startup_buffer_free
+      ;;
+    ahe-jit-function-256m)
+      mode_broker_socket=$function_jit_256_broker_socket
+      mode_cache_namespace=phpunit-$phpunit_commit-jit-function-256m
+      mode_php_ini_scan_path=$function_jit_256_php_ini_scan_path
+      expect_jit_mode=function
+      jit_startup_buffer_free=$ahe_jit_function_256_startup_buffer_free
       ;;
     *)
       printf 'Cannot verify a non-AHE benchmark mode: %s\n' "$mode" >&2
@@ -391,7 +534,14 @@ verify_ahe_cache() {
       ;;
   esac
 
+  if [[ "$benchmark_suite" == jit-buffer-sweep ]]; then
+    script_baseline="$result_directory/$mode-script-baseline.json"
+    expect_no_new_scripts=1
+  fi
+
   env \
+    "AHE_BENCHMARK_SCRIPT_BASELINE=$script_baseline" \
+    "AHE_BENCHMARK_EXPECT_NO_NEW_SCRIPTS=$expect_no_new_scripts" \
     "AHE_BENCHMARK_EXPECT_JIT_MODE=$expect_jit_mode" \
     "AHE_BENCHMARK_JIT_STARTUP_BUFFER_FREE=$jit_startup_buffer_free" \
     "AHE_BROKER_SOCKET=$mode_broker_socket" \
@@ -422,6 +572,20 @@ prepare_result_cache() {
   esac
 }
 
+jit_metrics_from_report() {
+  local report_file=$1
+
+  # The single-quoted program is PHP, not shell source.
+  # shellcheck disable=SC2016
+  "$ahe_php" -n -r '
+    $report = json_decode(file_get_contents($argv[1]), true, flags: JSON_THROW_ON_ERROR);
+    $bufferSize = (int) ($report["jit_buffer_size"] ?? 0);
+    $bufferFree = (int) ($report["jit_buffer_free"] ?? 0);
+    $startupFree = (int) ($report["jit_startup_buffer_free"] ?? 0);
+    printf("%d %d %d\n", $bufferSize, $bufferFree, max(0, $startupFree - $bufferFree));
+  ' "$report_file"
+}
+
 run_timed() {
   local cache_state=$1
   local mode=$2
@@ -429,7 +593,11 @@ run_timed() {
   local log_file="$result_directory/$cache_state-$mode-$iteration.log"
   local elapsed_seconds
   local finished_nanoseconds
+  local jit_buffer_free=0
+  local jit_buffer_size=0
+  local jit_bytes_emitted=0
   local max_rss_kb
+  local report_file=
   local started_nanoseconds
   local attachment_directory=
 
@@ -455,13 +623,15 @@ run_timed() {
         "$cache_state" "$iteration" "$log_file" >&2
       return 1
     fi
-    if mode_uses_ahe "$mode" \
-      && ! verify_ahe_cache \
-        "$mode" \
-        "$result_directory/$cache_state-$mode-$iteration-opcache-status.json"; then
-      printf 'The %s/AHE sample %s left an unusable shared cache; see %s\n' \
-        "$cache_state" "$iteration" "$log_file" >&2
-      return 1
+    if mode_uses_ahe "$mode"; then
+      report_file="$result_directory/$cache_state-$mode-$iteration-opcache-status.json"
+      if ! verify_ahe_cache "$mode" "$report_file"; then
+        printf 'The %s/AHE sample %s left an unusable shared cache; see %s\n' \
+          "$cache_state" "$iteration" "$log_file" >&2
+        return 1
+      fi
+      read -r jit_buffer_size jit_buffer_free jit_bytes_emitted \
+        < <(jit_metrics_from_report "$report_file")
     fi
     read -r max_rss_kb <"$timing_file"
     elapsed_seconds=$(awk \
@@ -475,8 +645,15 @@ run_timed() {
     return "$exit_status"
   fi
 
-  printf '%s\t%s\t%s\t%s\t%s\n' \
-    "$cache_state" "$mode" "$iteration" "$elapsed_seconds" "$max_rss_kb" \
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    "$cache_state" \
+    "$mode" \
+    "$iteration" \
+    "$elapsed_seconds" \
+    "$max_rss_kb" \
+    "$jit_buffer_size" \
+    "$jit_buffer_free" \
+    "$jit_bytes_emitted" \
     >>"$samples_file"
   printf '%-4s %-20s sample %s: %ss, %s KiB max RSS\n' \
     "$cache_state" "$mode" "$iteration" "$elapsed_seconds" "$max_rss_kb"
@@ -502,8 +679,12 @@ median_field() {
 }
 
 mkdir -p "$phpstan_tmp_directory"
-printf 'result_cache\tmode\titeration\telapsed_seconds\tmax_rss_kb\n' >"$samples_file"
-printf 'mode\telapsed_seconds\tmax_rss_kb\n' >"$primes_file"
+printf 'result_cache\tmode\titeration\telapsed_seconds\tmax_rss_kb\tjit_buffer_size\tjit_buffer_free\tjit_bytes_emitted\n' \
+  >"$samples_file"
+printf 'mode\telapsed_seconds\tmax_rss_kb\tjit_buffer_size\tjit_buffer_free\tjit_bytes_emitted\n' \
+  >"$primes_file"
+printf 'mode\tjit_buffer_size\tjit_buffer_free\tjit_bytes_emitted\n' \
+  >"$idle_probes_file"
 ahe_git_revision=$(git -C "$repository_root" rev-parse HEAD)
 ahe_worktree_dirty=0
 if [[ -n "$(git -C "$repository_root" status --porcelain=v1 --untracked-files=all)" ]]; then
@@ -526,10 +707,16 @@ fi
   printf 'ahe_worktree_dirty=%s\n' "$ahe_worktree_dirty"
   printf 'system=%s\n' "$(uname -srmo)"
   printf 'cpu_model=%s\n' "$cpu_model"
+  printf 'benchmark_suite=%s\n' "$benchmark_suite"
   printf 'samples_per_cell=%s\n' "$samples"
   printf 'modes=%s\n' "${benchmark_modes[*]}"
-  printf 'jit_modes=tracing,function\n'
-  printf 'jit_buffer_size=64M\n'
+  if [[ "$benchmark_suite" == full ]]; then
+    printf 'jit_modes=tracing,function\n'
+    printf 'jit_buffer_size=64M\n'
+  else
+    printf 'jit_modes=function\n'
+    printf 'jit_buffer_sizes=64M,128M,256M\n'
+  fi
 } >"$result_directory/metadata.txt"
 
 effective_settings=$(
@@ -606,6 +793,37 @@ if ! PHP_INI_SCAN_DIR="$function_jit_php_ini_scan_path" "$ahe_php" -r '
     }
   '; then
   exit 1
+fi
+
+verify_function_jit_buffer_profile() {
+  local expected_size=$1
+  local php_ini_scan_path=$2
+
+  # The single-quoted program is PHP, not shell source.
+  # shellcheck disable=SC2016
+  env \
+    "AHE_BENCHMARK_EXPECT_JIT_BUFFER_SIZE=$expected_size" \
+    "PHP_INI_SCAN_DIR=$php_ini_scan_path" \
+    "$ahe_php" -r '
+      $jit = opcache_get_status(false)["jit"] ?? null;
+      $expectedSize = (string) getenv("AHE_BENCHMARK_EXPECT_JIT_BUFFER_SIZE");
+      if (!is_array($jit)
+          || ($jit["enabled"] ?? false) !== true
+          || ($jit["on"] ?? false) !== true
+          || ($jit["kind"] ?? null) !== 0
+          || ($jit["opt_level"] ?? null) !== 5
+          || ($jit["buffer_size"] ?? 0) <= 0
+          || ini_get("opcache.jit_buffer_size") !== $expectedSize
+      ) {
+          fwrite(STDERR, "Function-JIT mode did not load buffer size $expectedSize.\n");
+          exit(1);
+      }
+    '
+}
+
+if [[ "$benchmark_suite" == jit-buffer-sweep ]]; then
+  verify_function_jit_buffer_profile 128M "$function_jit_128_php_ini_scan_path"
+  verify_function_jit_buffer_profile 256M "$function_jit_256_php_ini_scan_path"
 fi
 
 start_broker() {
@@ -689,23 +907,49 @@ capture_ahe_jit_startup_baseline() {
     >>"$result_directory/metadata.txt"
 }
 
-start_broker ahe "$broker_socket"
-start_broker ahe-jit "$jit_broker_socket"
-start_broker ahe-jit-function "$function_jit_broker_socket"
-capture_ahe_jit_startup_baseline \
-  ahe_jit_startup_buffer_free \
-  ahe-jit \
-  "$jit_broker_socket" \
-  "phpunit-$phpunit_commit-jit" \
-  "$tracing_jit_php_ini_scan_path" \
-  tracing
-capture_ahe_jit_startup_baseline \
-  ahe_jit_function_startup_buffer_free \
-  ahe-jit-function \
-  "$function_jit_broker_socket" \
-  "phpunit-$phpunit_commit-jit-function" \
-  "$function_jit_php_ini_scan_path" \
-  function
+if mode_is_enabled ahe; then
+  start_broker ahe "$broker_socket"
+fi
+if mode_is_enabled ahe-jit; then
+  start_broker ahe-jit "$jit_broker_socket"
+  capture_ahe_jit_startup_baseline \
+    ahe_jit_startup_buffer_free \
+    ahe-jit \
+    "$jit_broker_socket" \
+    "phpunit-$phpunit_commit-jit" \
+    "$tracing_jit_php_ini_scan_path" \
+    tracing
+fi
+if mode_is_enabled ahe-jit-function || mode_is_enabled ahe-jit-function-64m; then
+  start_broker ahe-jit-function-64m "$function_jit_broker_socket"
+  capture_ahe_jit_startup_baseline \
+    ahe_jit_function_startup_buffer_free \
+    ahe-jit-function-64m \
+    "$function_jit_broker_socket" \
+    "phpunit-$phpunit_commit-jit-function" \
+    "$function_jit_php_ini_scan_path" \
+    function
+fi
+if mode_is_enabled ahe-jit-function-128m; then
+  start_broker ahe-jit-function-128m "$function_jit_128_broker_socket"
+  capture_ahe_jit_startup_baseline \
+    ahe_jit_function_128_startup_buffer_free \
+    ahe-jit-function-128m \
+    "$function_jit_128_broker_socket" \
+    "phpunit-$phpunit_commit-jit-function-128m" \
+    "$function_jit_128_php_ini_scan_path" \
+    function
+fi
+if mode_is_enabled ahe-jit-function-256m; then
+  start_broker ahe-jit-function-256m "$function_jit_256_broker_socket"
+  capture_ahe_jit_startup_baseline \
+    ahe_jit_function_256_startup_buffer_free \
+    ahe-jit-function-256m \
+    "$function_jit_256_broker_socket" \
+    "phpunit-$phpunit_commit-jit-function-256m" \
+    "$function_jit_256_php_ini_scan_path" \
+    function
+fi
 
 echo "Priming PHPStan's generated container and result cache..."
 if ! run_analysis vanilla '' >"$result_directory/result-cache-prime.log" 2>&1; then
@@ -723,8 +967,12 @@ run_ahe_prime() {
   local mode=$1
   local prime_attachment_directory="$runtime_directory/attachments-$mode-prime"
   local log_file="$result_directory/$mode-prime.log"
+  local report_file="$result_directory/$mode-prime-opcache-status.json"
   local elapsed_seconds
   local finished_nanoseconds
+  local jit_buffer_free
+  local jit_buffer_size
+  local jit_bytes_emitted
   local max_rss_kb
   local started_nanoseconds
 
@@ -751,7 +999,7 @@ EOF
       "$mode" "$log_file" >&2
     return 1
   fi
-  if ! verify_ahe_cache "$mode" "$result_directory/$mode-prime-opcache-status.json"; then
+  if ! verify_ahe_cache "$mode" "$report_file"; then
     printf 'The %s retained-generation prime left an unusable shared cache.\n' \
       "$mode" >&2
     return 1
@@ -761,8 +1009,35 @@ EOF
     -v started="$started_nanoseconds" \
     -v finished="$finished_nanoseconds" \
     'BEGIN { printf "%.6f", (finished - started) / 1000000000 }')
-  printf '%s\t%s\t%s\n' "$mode" "$elapsed_seconds" "$max_rss_kb" \
+  read -r jit_buffer_size jit_buffer_free jit_bytes_emitted < <(
+    jit_metrics_from_report "$report_file"
+  )
+  printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
+    "$mode" \
+    "$elapsed_seconds" \
+    "$max_rss_kb" \
+    "$jit_buffer_size" \
+    "$jit_buffer_free" \
+    "$jit_bytes_emitted" \
     | tee -a "$primes_file"
+}
+
+run_ahe_idle_probe() {
+  local mode=$1
+  local report_file="$result_directory/$mode-idle-opcache-status.json"
+  local jit_buffer_free
+  local jit_buffer_size
+  local jit_bytes_emitted
+
+  if ! verify_ahe_cache "$mode" "$report_file"; then
+    printf 'The %s idle probe left an unusable shared cache.\n' "$mode" >&2
+    return 1
+  fi
+  read -r jit_buffer_size jit_buffer_free jit_bytes_emitted \
+    < <(jit_metrics_from_report "$report_file")
+  printf '%s\t%s\t%s\t%s\n' \
+    "$mode" "$jit_buffer_size" "$jit_buffer_free" "$jit_bytes_emitted" \
+    | tee -a "$idle_probes_file"
 }
 
 run_file_cache_prime() {
@@ -810,7 +1085,8 @@ run_file_cache_prime() {
     -v started="$started_nanoseconds" \
     -v finished="$finished_nanoseconds" \
     'BEGIN { printf "%.6f", (finished - started) / 1000000000 }')
-  printf '%s\t%s\t%s\n' opcache-file-cache "$elapsed_seconds" "$max_rss_kb" \
+  printf '%s\t%s\t%s\t0\t0\t0\n' \
+    opcache-file-cache "$elapsed_seconds" "$max_rss_kb" \
     | tee -a "$primes_file"
   printf 'opcache_file_cache_files=%s\n' "$file_cache_file_count" \
     >>"$result_directory/metadata.txt"
@@ -854,19 +1130,35 @@ warm_file_cache_for_result_cache() {
 }
 
 echo "Priming the retained AHE generations with result-cache-cold analyses..."
-run_ahe_prime ahe
-run_ahe_prime ahe-jit
-run_ahe_prime ahe-jit-function
-echo "Priming OPcache's persistent file cache with a result-cache-cold analysis..."
-run_file_cache_prime
+for mode in "${benchmark_modes[@]}"; do
+  if mode_uses_ahe "$mode"; then
+    run_ahe_prime "$mode"
+  fi
+done
+if [[ "$benchmark_suite" == jit-buffer-sweep ]]; then
+  echo "Checking retained JIT capacity across idle attachment probes..."
+  for mode in "${benchmark_modes[@]}"; do
+    if [[ "$mode" == ahe-jit-function-* ]]; then
+      run_ahe_idle_probe "$mode"
+    fi
+  done
+fi
+if mode_is_enabled opcache-file-cache; then
+  echo "Priming OPcache's persistent file cache with a result-cache-cold analysis..."
+  run_file_cache_prime
+fi
 
-for cache_state in cold warm; do
+for cache_state in "${cache_states[@]}"; do
   if [[ "$cache_state" == warm ]]; then
     echo "Warming the retained generations for PHPStan result-cache reuse..."
-    warm_ahe_generation_for_result_cache ahe
-    warm_ahe_generation_for_result_cache ahe-jit
-    warm_ahe_generation_for_result_cache ahe-jit-function
-    warm_file_cache_for_result_cache
+    for mode in "${benchmark_modes[@]}"; do
+      if mode_uses_ahe "$mode"; then
+        warm_ahe_generation_for_result_cache "$mode"
+      fi
+    done
+    if mode_is_enabled opcache-file-cache; then
+      warm_file_cache_for_result_cache
+    fi
   fi
   for ((iteration = 1; iteration <= samples; iteration++)); do
     for ((order_index = 0; order_index < ${#benchmark_modes[@]}; order_index++)); do
@@ -885,15 +1177,15 @@ for cache_state in cold warm; do
 done
 
 summary_file="$result_directory/summary.tsv"
-printf 'result_cache\tmode\tmedian_seconds\tspeedup_vs_vanilla_percent\tmedian_rss_kb\n' \
-  >"$summary_file"
+printf 'result_cache\tmode\tmedian_seconds\tspeedup_vs_%s_percent\tmedian_rss_kb\n' \
+  "$summary_baseline_mode" >"$summary_file"
 
-for cache_state in cold warm; do
-  vanilla_seconds=$(median_field "$cache_state" vanilla 4)
+for cache_state in "${cache_states[@]}"; do
+  baseline_seconds=$(median_field "$cache_state" "$summary_baseline_mode" 4)
   for mode in "${benchmark_modes[@]}"; do
     mode_seconds=$(median_field "$cache_state" "$mode" 4)
     mode_rss=$(median_field "$cache_state" "$mode" 5)
-    speedup=$(awk -v baseline="$vanilla_seconds" -v candidate="$mode_seconds" \
+    speedup=$(awk -v baseline="$baseline_seconds" -v candidate="$mode_seconds" \
       'BEGIN { printf "%.1f", baseline == 0 ? 0 : (baseline - candidate) * 100 / baseline }')
     printf '%s\t%s\t%s\t%s\t%s\n' \
       "$cache_state" "$mode" "$mode_seconds" "$speedup" "$mode_rss" \
@@ -901,37 +1193,56 @@ for cache_state in cold warm; do
   done
 done
 
-comparison_from=(
-  vanilla
-  vanilla
-  opcache
-  opcache-file-cache
-  opcache
-  opcache
-  opcache
-  ahe
-  opcache-jit
-  opcache-jit
-  opcache-jit-function
-  ahe
-)
-comparison_to=(
-  opcache
-  opcache-file-cache
-  opcache-file-cache
-  ahe
-  opcache-jit
-  opcache-jit-function
-  ahe
-  ahe-jit
-  ahe-jit
-  opcache-jit-function
-  ahe-jit-function
-  ahe-jit-function
-)
+if [[ "$benchmark_suite" == full ]]; then
+  comparison_from=(
+    vanilla
+    vanilla
+    opcache
+    opcache-file-cache
+    opcache
+    opcache
+    opcache
+    ahe
+    opcache-jit
+    opcache-jit
+    opcache-jit-function
+    ahe
+  )
+  comparison_to=(
+    opcache
+    opcache-file-cache
+    opcache-file-cache
+    ahe
+    opcache-jit
+    opcache-jit-function
+    ahe
+    ahe-jit
+    ahe-jit
+    opcache-jit-function
+    ahe-jit-function
+    ahe-jit-function
+  )
+else
+  comparison_from=(
+    ahe
+    ahe
+    ahe
+    ahe-jit-function-64m
+    ahe-jit-function-64m
+    ahe-jit-function-128m
+  )
+  comparison_to=(
+    ahe-jit-function-64m
+    ahe-jit-function-128m
+    ahe-jit-function-256m
+    ahe-jit-function-128m
+    ahe-jit-function-256m
+    ahe-jit-function-256m
+  )
+fi
 comparisons_file="$result_directory/comparisons.tsv"
 printf 'result_cache\tbaseline_mode\tcandidate_mode\tspeedup_percent\n' >"$comparisons_file"
-for cache_state in cold warm; do
+for cache_state in "${cache_states[@]}"; do
   for comparison_index in "${!comparison_from[@]}"; do
     baseline_mode=${comparison_from[$comparison_index]}
     candidate_mode=${comparison_to[$comparison_index]}

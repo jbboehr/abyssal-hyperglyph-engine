@@ -85,8 +85,14 @@ nix develop
 scripts/benchmark-phpstan.sh --samples 8
 ```
 
-The benchmark compares vanilla PHP, process-local OPcache, OPcache's persistent
-file cache, and retained AHE OPcache, including matched tracing- and
+Run the focused retained whole-function-JIT buffer sweep with:
+
+```console
+scripts/benchmark-phpstan.sh --jit-buffer-sweep --samples 4
+```
+
+The default benchmark compares vanilla PHP, process-local OPcache, OPcache's
+persistent file cache, and retained AHE OPcache, including matched tracing- and
 whole-function-JIT variants, while separately controlling whether PHPStan's
 result cache is cold or warm. See
 [`benchmarks/phpstan/README.md`](benchmarks/phpstan/README.md) for the cache

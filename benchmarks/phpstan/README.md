@@ -13,6 +13,18 @@ nix develop
 scripts/benchmark-phpstan.sh --samples 8
 ```
 
+To isolate whole-function-JIT buffer capacity from the larger matrix, run:
+
+```console
+scripts/benchmark-phpstan.sh --jit-buffer-sweep --samples 4
+```
+
+This focused suite compares plain AHE with separate retained 64, 128, and
+256 MiB function-JIT generations. It measures only the cold PHPStan result-cache
+state, uses a complete four-row counterbalancing block, and records each
+generation's prime time, max RSS, JIT capacity, remaining capacity, and emitted
+bytes in `primes.tsv`. Per-sample capacity is recorded in `samples.tsv`.
+
 This also provides real-world regression coverage for cross-process class
 linking. The retained-generation prime and every timed AHE sample must prove
 that the PHPStan parent and workers attached successfully before the harness
@@ -32,7 +44,8 @@ Completed development measurements and their interpretation are recorded in
 
 ## Cache controls
 
-The harness runs eight modes with the same patched PHP binary and extension set:
+The default harness runs eight modes with the same patched PHP binary and
+extension set:
 
 - `vanilla`: CLI OPcache disabled;
 - `opcache`: ordinary process-local CLI OPcache;
@@ -65,18 +78,26 @@ The benchmark reports two independent PHPStan result-cache states:
 - `warm`: the same primed result-cache snapshot is restored before every timed
   analysis.
 
-PHPStan's generated dependency-injection container remains warm and at the same
-path throughout, so it is not confused with the result cache. A Latin-square
-order puts every mode in every execution position and varies its neighbors to
-reduce ordering and carryover bias. Sample counts must be a
-multiple of the eight modes so the harness always executes complete
+PHPStan generates two uniquely named Nette dependency-injection containers per
+analysis. The default matrix preserves that real-world behavior, including its
+cache churn. The focused JIT-buffer sweep instead gives every mode the same
+generated OPcache blacklist for these disposable containers; every process
+asserts that the blacklist is active, and post-sample probes reject any script
+added after the retained-generation prime. This keeps the capacity experiment
+focused on reusable code rather than repeated compilation of dead container
+paths.
+
+A Latin-square order puts every mode in every execution position and varies its
+neighbors to reduce ordering and carryover bias. Sample counts must be a
+multiple of the selected mode count so the harness always executes complete
 counterbalancing blocks. Each AHE generation is primed with a complete,
 result-cache-cold analysis before sample collection; these cache-populating
 invocations are timed and reported separately rather than mixed with attached
-samples. Before warm-result-cache samples begin, each retained generation
-processes that snapshot once so the result-cache PHP file itself is already
-represented in OPcache. The persistent file cache receives the same transition;
-these warmups are validated but not mixed into the steady-state timings.
+samples. Before warm-result-cache samples begin in the default matrix, each
+retained generation processes that snapshot once so the result-cache PHP file
+itself is already represented in OPcache. The persistent file cache receives
+the same transition; these warmups are validated but not mixed into the
+steady-state timings.
 
 Every mode loads the same file through PHPStan's `--autoload-file` option so the
 result-cache configuration is identical. It asserts the expected JIT state in

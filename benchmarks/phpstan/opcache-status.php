@@ -16,6 +16,28 @@ if (!is_array($status)) {
 
 $scripts = $status['scripts'] ?? [];
 $scriptPaths = array_keys(is_array($scripts) ? $scripts : []);
+sort($scriptPaths);
+$newScriptPaths = [];
+$scriptBaseline = (string) getenv('AHE_BENCHMARK_SCRIPT_BASELINE');
+if ($scriptBaseline !== '') {
+    if (is_file($scriptBaseline)) {
+        $baselineContents = file_get_contents($scriptBaseline);
+        $baselineScriptPaths = $baselineContents === false
+            ? null
+            : json_decode($baselineContents, true, flags: JSON_THROW_ON_ERROR);
+        if (!is_array($baselineScriptPaths)) {
+            fwrite(STDERR, "The retained-script baseline is unreadable.\n");
+            exit(1);
+        }
+        $newScriptPaths = array_values(array_diff($scriptPaths, $baselineScriptPaths));
+    } elseif (file_put_contents(
+        $scriptBaseline,
+        json_encode($scriptPaths, JSON_PRETTY_PRINT | JSON_THROW_ON_ERROR) . "\n",
+    ) === false) {
+        fwrite(STDERR, "Could not write the retained-script baseline.\n");
+        exit(1);
+    }
+}
 $phpstanPharScripts = array_filter(
     $scriptPaths,
     static fn (string $path): bool => str_starts_with($path, 'phar://')
@@ -50,6 +72,7 @@ $report = [
     'free_memory' => $status['memory_usage']['free_memory'] ?? null,
     'phpstan_phar_scripts' => count($phpstanPharScripts),
     'project_scripts' => count($projectScripts),
+    'new_scripts_since_prime' => $newScriptPaths,
     'jit_enabled' => $jitEnabled,
     'jit_mode' => $actualJitMode,
     'jit_buffer_size' => is_array($jit) ? ($jit['buffer_size'] ?? null) : null,
@@ -69,6 +92,10 @@ if ($report['project_scripts'] === 0) {
 }
 if ($actualJitMode !== $expectedJitMode) {
     fwrite(STDERR, "The retained generation has the wrong JIT mode.\n");
+    exit(1);
+}
+if (getenv('AHE_BENCHMARK_EXPECT_NO_NEW_SCRIPTS') === '1' && $newScriptPaths !== []) {
+    fwrite(STDERR, "The retained generation accumulated scripts after its prime.\n");
     exit(1);
 }
 if ($expectedJitMode !== 'off'

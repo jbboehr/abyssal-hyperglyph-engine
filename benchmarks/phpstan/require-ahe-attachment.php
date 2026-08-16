@@ -2,6 +2,16 @@
 
 declare(strict_types=1);
 
+$expectedBlacklist = getenv('AHE_BENCHMARK_EXPECT_BLACKLIST') === '1';
+$expectedBlacklistFile = (string) getenv('AHE_BENCHMARK_BLACKLIST_FILE');
+$actualBlacklistFile = (string) ini_get('opcache.blacklist_filename');
+if (($expectedBlacklist && $actualBlacklistFile !== $expectedBlacklistFile)
+    || (!$expectedBlacklist && $actualBlacklistFile !== '')
+) {
+    fwrite(STDERR, "A PHPStan process started with the wrong OPcache blacklist.\n");
+    exit(86);
+}
+
 $expectedFileCache = getenv('AHE_BENCHMARK_EXPECT_FILE_CACHE') === '1';
 $fileCacheOnly = filter_var(ini_get('opcache.file_cache_only'), FILTER_VALIDATE_BOOL);
 if ($fileCacheOnly !== $expectedFileCache) {

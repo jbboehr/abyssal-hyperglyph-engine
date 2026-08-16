@@ -317,3 +317,92 @@ cold-analysis gain that stock PHP 8.4 cannot provide. The next useful
 experiment is therefore a larger function-JIT buffer sweep, measuring prime
 cost, saturation, cold time, and memory rather than adding more bytecode-cache
 machinery.
+
+## 2026-08-16 00:38 UTC: function-JIT capacity and container churn
+
+Unfiltered artifact ID: `20260816T003819Z`
+
+The focused sweep compared plain AHE with retained whole-function JIT using 64,
+128, and 256 MiB buffers. It ran three complete four-row counterbalancing
+blocks with a cold PHPStan result cache. Each size had a separate broker and
+retained generation.
+
+The prime established that PHPStan's reusable workload needs about 94 MiB when
+its generated Nette containers are cacheable. The 64 MiB generation saturated;
+128 MiB retained 93,811,515 bytes beyond startup and initially had 40,403,321
+bytes free; 256 MiB retained the same code and initially had 174,621,033 bytes
+free.
+
+Capacity did not remain stable. Every subsequent analysis added exactly two
+cached scripts, about 2.87 MiB of shared bytecode, and about 4.85 MiB of JIT
+code. An idle attached status probe consumed only nine bytes, proving the
+growth came from PHPStan rather than measurement. The 128 MiB generation
+reached zero free bytes by sample 11. The 256 MiB generation ended sample 12
+with 116,450,464 bytes free after cumulative emitted code reached 151,982,100
+bytes.
+
+A follow-up path-manifest run identified the additions as two uniquely named
+files under `phpstan/cache/nette.configurator/Container_<hash>.php` per
+analysis. PHPStan deletes or supersedes these generated containers, but the
+retained OPcache generation cannot reclaim their bytecode or native code. A
+larger JIT buffer therefore delays exhaustion without fixing the underlying
+cache churn.
+
+| Mode | Prime time | Prime max RSS | Cold median | Cold median max RSS | Final JIT free |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| AHE | 4.336 s | 228,876 KiB | 3.789 s | 231,546 KiB | — |
+| AHE plus function JIT, 64 MiB | 7.281 s | 292,216 KiB | 2.887 s | 292,412 KiB | 0 B |
+| AHE plus function JIT, 128 MiB | 8.282 s | 316,468 KiB | 2.941 s | 313,018 KiB | 0 B |
+| AHE plus function JIT, 256 MiB | 8.275 s | 312,664 KiB | 2.945 s | 314,660 KiB | 116,450,464 B |
+
+The larger buffers did not improve median execution time. In this configuration
+they allowed each invocation to spend time compiling a fresh pair of disposable
+containers, while the already-saturated 64 MiB generation skipped that work.
+
+## 2026-08-16 00:48 UTC: stable function-JIT capacity
+
+Filtered artifact ID: `20260816T004808Z`
+
+The harness now gives every focused-sweep mode the same generated OPcache
+blacklist for PHPStan's ephemeral Nette containers. Parent and worker processes
+assert the exact blacklist setting. A script-path manifest captured after each
+prime lets every later status probe fail if the retained generation accumulates
+another script.
+
+Across three complete four-row blocks, every generation stayed at 5,493 cached
+scripts and reported no post-prime script paths. The 128 MiB generation's free
+JIT capacity moved from 45,240,336 to 45,238,960 bytes across all 12 samples;
+the 256 MiB generation moved from 179,458,080 to 179,456,752 bytes. This reduces
+per-analysis JIT growth from about 4.85 MiB to roughly 128 bytes.
+
+Excluding the two disposable prime containers reduced reusable emitted code to
+about 88.97 MiB. A 128 MiB buffer therefore provides about 45.2 MiB of stable
+headroom. A 256 MiB buffer retains the same code and leaves about 179.5 MiB
+unused.
+
+| Mode | Prime time | Prime max RSS | Cold median | Cold median max RSS | Speedup versus AHE |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| AHE | 4.352 s | 226,592 KiB | 4.000 s | 230,818 KiB | — |
+| AHE plus function JIT, 64 MiB | 7.894 s | 286,856 KiB | 3.205 s | 290,448 KiB | 19.9% |
+| AHE plus function JIT, 128 MiB | 8.309 s | 308,492 KiB | 2.988 s | 307,916 KiB | 25.3% |
+| AHE plus function JIT, 256 MiB | 8.147 s | 313,184 KiB | 3.085 s | 307,730 KiB | 22.9% |
+
+Host activity produced several large, mode-specific outliers, including 5.3 s
+and 8.8 s samples in one row. The table supports the large retained-JIT gain but
+does not establish small timing differences among buffer sizes. A quieter
+earlier block also placed the three JIT modes within a few percent of one
+another.
+
+For a complete, sustainable retained function-JIT cache, 128 MiB is the best
+provisional profile: it is the smallest tested non-saturating buffer, retains
+the same reusable code as 256 MiB, and remains stable once ephemeral containers
+are excluded. The 64 MiB profile remains reasonable when lower memory use is
+more important than compiling every eligible function; no reliable execution
+benefit from the additional 22 MiB of native code has been demonstrated. There
+is no current reason to use 256 MiB.
+
+The more important operational result is the blacklist, not the exact buffer
+size. Without excluding or stabilizing PHPStan's generated containers, both
+OPcache shared memory and the JIT buffer grow on every invocation. Production
+integration should either supply this exclusion automatically or create a
+bounded generation lifecycle before enabling retained whole-function JIT.
